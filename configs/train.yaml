@@ -1,0 +1,71 @@
+# Training configuration.
+# Consumed by src/nba_sim/training/loop.py.
+
+data_config: configs/data.yaml
+model_config: configs/model.yaml
+
+paths:
+  checkpoint_dir: models
+  report_dir: reports
+
+run:
+  seed: 42
+  device: cuda              # cuda | cpu | auto
+  precision: bf16           # bf16 | fp32
+  deterministic: true
+
+optim:
+  name: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.95]
+  grad_clip_max_norm: 1.0
+
+schedule:
+  name: cosine_with_warmup
+  warmup_steps: 500
+  max_epochs: 30
+
+loop:
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  eval_every_epoch: true
+
+curriculum:
+  team_level_pretrain_epochs: 5
+  joint_epochs: 25
+
+early_stopping:
+  enabled: true
+  metric: val_composite_nll
+  mode: min
+  patience: 5
+
+loss_weights:
+  # Starting weights; tuned once on validation, then fixed.
+  minutes: 1.0
+  pace: 1.0
+  off_rtg: 1.0
+  fga: 1.0
+  tpa: 1.0
+  fta: 1.0
+  fgm: 1.0
+  tpm: 1.0
+  ftm: 1.0
+  oreb: 1.0
+  dreb: 1.0
+  ast: 1.0
+  stl: 1.0
+  blk: 1.0
+  tov: 1.0
+  pf: 1.0
+  gate: 0.5
+  embedding_pool: 1.0e-3    # partial-pooling L2 on player embedding deltas
+
+tracking:
+  backend: wandb            # wandb | tensorboard | none
+  project: nba-sim
+  entity: null
+  log_every_n_steps: 25
+  also_write_tensorboard: true

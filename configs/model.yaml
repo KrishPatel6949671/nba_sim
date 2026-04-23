@@ -1,0 +1,62 @@
+# Model architecture configuration.
+# Consumed by src/nba_sim/models/hierarchical.py.
+# Tensor-shape reference in PLAN.md §4.
+
+architecture: hierarchical    # {baseline | hierarchical}
+
+dims:
+  d_player_raw: 48            # pre-encoder feature vector per player
+  d_player: 64                # player feature embedding dim (after encoder)
+  d_team: 128                 # pooled team representation dim
+  d_context: 32               # game-context encoding dim
+  d_matchup: 16               # matchup-feature encoding dim
+
+roster:
+  max_active_players: 15      # padding target; games rarely use more
+
+embeddings:
+  n_players: 5000
+  d_player_embed: 32
+  n_teams: 40
+  d_team_embed: 16
+  n_roles: 4                  # starter / rotation / end-of-bench / inactive
+  d_role: 8
+
+encoder:
+  player_mlp_hidden: [128, 128]
+  player_mlp_dropout: 0.1
+  roster_attention_heads: 4
+  roster_attention_dropout: 0.1
+  context_mlp_hidden: [64]
+
+team_head:
+  hidden: [128, 64]
+  pace_noise_init: 3.0        # init σ for Normal(pace)
+  rtg_noise_init: 4.0         # init σ for Normal(off_rtg)
+
+player_alloc_head:
+  hidden: [128, 128]
+  dropout: 0.1
+  dirichlet_alpha_init_scale: 2.0   # mean α ≈ 2 → moderately informative prior
+  negbin_logits_init: 0.0
+  gate_bias_init: 1.5               # sigmoid(1.5) ≈ 0.82 → most rostered players play
+
+distributions:
+  # Which torch.distributions class each stat uses. See PLAN.md §4.3.
+  minutes: Dirichlet
+  pace: Normal
+  off_rtg: Normal
+  fga: NegativeBinomial
+  tpa: NegativeBinomial
+  fta: NegativeBinomial
+  fgm: Binomial             # bounded by FGA
+  tpm: Binomial             # bounded by 3PA (and by FGM)
+  ftm: Binomial             # bounded by FTA
+  oreb: NegativeBinomial
+  dreb: NegativeBinomial
+  ast: NegativeBinomial
+  stl: NegativeBinomial
+  blk: NegativeBinomial
+  tov: NegativeBinomial
+  pf: NegativeBinomial
+  plays_in_game: Bernoulli

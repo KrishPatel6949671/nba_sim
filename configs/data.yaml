@@ -1,0 +1,45 @@
+# Data pipeline configuration.
+# Consumed by src/nba_sim/data/fetch.py, etl.py, splits.py.
+
+seasons:
+  # Start year of each season (2023 == the 2023-24 season).
+  start: 2000
+  end: 2024
+
+paths:
+  raw: data/raw
+  interim: data/interim
+  processed: data/processed
+  cache: data/raw/.cache
+
+fetch:
+  endpoints:
+    - leaguegamefinder
+    - boxscoretraditionalv2
+    - boxscoreadvancedv2
+    - commonteamroster
+    - commonplayerinfo
+    - playergamelog
+    - leaguedashteamstats
+  min_delay_seconds: 0.6
+  request_timeout: 30
+  max_retries: 5
+  refresh_current_season: true
+
+scrape_bref:
+  enabled: false           # enable only to fill gaps
+  min_delay_seconds: 3.0
+  user_agent: "nba-sim research crawler"
+
+splits:
+  # Full-season held-out splits. See PLAN.md §6.1.
+  train: [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+          2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019,
+          2020, 2021]
+  val:   [2022]
+  test:  [2023]
+
+filters:
+  exclude_overtime: true
+  exclude_short_games: true   # team total MIN != 240
+  min_player_games_for_embedding: 10
