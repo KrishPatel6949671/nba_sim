@@ -25,8 +25,8 @@ classifiers = [
 dependencies = [
     # Core numerics / ML
     "torch==2.5.1",             # CUDA build selected via extra-index-url, see README
-    "numpy==2.1.3",
-    "scipy==1.14.1",
+    "numpy==1.26.4",            # pinned to 1.x because nba_api 1.7.0 caps numpy<2.0
+    "scipy==1.13.1",            # last scipy that supports numpy 1.x
     "scikit-learn==1.5.2",
     # Dataframes / storage
     "polars==1.17.1",
@@ -73,8 +73,7 @@ dev = [
 nba-sim = "nba_sim.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/krish/nba-sim"
-Issues = "https://github.com/krish/nba-sim/issues"
+Homepage = "https://github.com/KrishPatel6949671/nba_sim"
 
 [tool.setuptools.packages.find]
 where = ["src"]
