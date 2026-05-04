@@ -65,9 +65,9 @@ coverage.xml
 .pytype/
 
 # ML artifacts
-data/
-!data/.gitkeep
-models/
+/data/
+!/data/.gitkeep
+/models/
 checkpoints/
 wandb/
 mlruns/
