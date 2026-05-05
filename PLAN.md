@@ -45,8 +45,8 @@ Non-goals for v1 (explicit in §11): play-by-play, injuries mid-game, foul-outs,
 | Endpoint | Purpose | Granularity |
 | --- | --- | --- |
 | `leaguegamefinder.LeagueGameFinder` | canonical list of games by season (incl. game_id, date, matchup, home/away) | per game |
-| `boxscoretraditionalv2.BoxScoreTraditionalV2` | MIN, PTS, FG/3P/FT makes+attempts, REB split, AST, STL, BLK, TOV, PF, +/- | per player, per game |
-| `boxscoreadvancedv2.BoxScoreAdvancedV2` | OFFRTG, DEFRTG, pace, usage, TS%, eFG% — used as training targets and features | per team and per player, per game |
+| `boxscoretraditionalv3.BoxScoreTraditionalV3` | minutes, points, FG/3P/FT makes+attempts, rebound split, AST, STL, BLK, TOV, PF, +/- | per player, per game |
+| `boxscoreadvancedv3.BoxScoreAdvancedV3` | offensive/defensive rating, pace, usage, TS%, eFG% — used as training targets and features | per team and per player, per game |
 | `commonteamroster.CommonTeamRoster` | roster for a team on a given season | per team, per season |
 | `playergamelog.PlayerGameLog` | redundancy check + unlocks older seasons with missing per-game flags | per player, per season |
 | `commonplayerinfo.CommonPlayerInfo` | height, weight, position, draft year, country, experience | per player, lifetime |
@@ -502,7 +502,7 @@ nba-sim train             --config configs/train.yaml --model {baseline|hierarch
 nba-sim evaluate          --split {val|test} --checkpoint models/best.pt
 nba-sim simulate          --home BOS --away LAL --date 2025-02-14 [--n-samples 500] [--seed 42]
 nba-sim cache-stats
-nba-sim cache-clear       --endpoint boxscoretraditionalv2
+nba-sim cache-clear       --endpoint boxscoretraditionalv3
 ```
 
 Scripts in `scripts/` are one-liners that invoke the CLI with a preset config, meant for SLURM/cron:
