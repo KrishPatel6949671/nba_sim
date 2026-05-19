@@ -78,11 +78,11 @@ Defined as Pydantic v2 models in `src/nba_sim/data/schema.py`. Three layers:
 
 `src/nba_sim/data/etl.py` defines three functions, each a pure transform with a deterministic output path:
 
-- `raw_to_interim(season: int) -> Path` — reads `data/raw/`, emits `data/interim/{season}/`.
+- `raw_to_interim(season: int) -> Path` — reads `data/raw/` via the typed `fetch.*` helpers, emits `data/interim/{season}/{games,player_box,team_box,rosters}.parquet` plus `qa_report.json`. Per-game advanced metrics (`pace`, `off_rtg`, `def_rtg`) are merged into `team_box` from `BoxScoreAdvancedV3`. Rosters are **derived** from box-score appearances (union of `personId`s per team per season) rather than fetched from `CommonTeamRoster` — cheaper and sufficient since v1 features don't read season rosters directly; the model only sees the active roster per game (from `player_box`).
 - `interim_to_processed(splits: SplitSpec) -> Path` — reads all seasons in `splits.train ∪ val ∪ test`, joins rosters + rolling features (see §3), emits `data/processed/{train,val,test}.parquet`.
 - `build_feature_tables(season: int) -> None` — precomputes rolling aggregates that multiple features share.
 
-All ETL is **idempotent** (writes to a tmp file then renames) and **incremental** (skips a season whose output parquet already exists and is newer than all its inputs — mtime-based).
+All ETL is **idempotent** (writes to a tmp file then renames) and **incremental** (skips a season whose output parquet already exists and is newer than the upstream cache directories' mtimes — coarse but cheap; re-fetching any game's box score invalidates the whole season's interim).
 
 ### 2.5 Edge cases
 
