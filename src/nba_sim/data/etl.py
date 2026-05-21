@@ -44,6 +44,11 @@ from nba_sim.data.schema import (
     Roster,
     TeamBoxLine,
 )
+from nba_sim.features.rolling import (
+    player_rolling,
+    season_to_date,
+    team_rolling,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +73,12 @@ def interim_dir() -> Path:
     return Path(p).expanduser().resolve()
 
 
+def processed_dir() -> Path:
+    """Same pattern as interim_dir — tests redirect via env var."""
+    p = os.environ.get("NBA_SIM_PROCESSED_DIR", "data/processed")
+    return Path(p).expanduser().resolve()
+
+
 def _season_dir(season: int) -> Path:
     return interim_dir() / str(season)
 
@@ -79,6 +90,14 @@ PLAYER_BOX_FILENAME = "player_box.parquet"
 TEAM_BOX_FILENAME = "team_box.parquet"
 ROSTERS_FILENAME = "rosters.parquet"
 QA_REPORT_FILENAME = "qa_report.json"
+# Feature-table outputs (produced by build_feature_tables).
+PLAYER_FEATURES_FILENAME = "player_features.parquet"
+TEAM_FEATURES_FILENAME = "team_features.parquet"
+SEASON_TO_DATE_FILENAME = "season_to_date.parquet"
+# Processed-layer outputs (produced by interim_to_processed).
+PROCESSED_TRAIN_FILENAME = "train.parquet"
+PROCESSED_VAL_FILENAME = "val.parquet"
+PROCESSED_TEST_FILENAME = "test.parquet"
 
 # Per PLAN.md §2.5: 5 players × 48 minutes = 240 per team in regulation,
 # +25 per OT period (5 players × 5 min). Anything outside this set means
@@ -450,14 +469,182 @@ def raw_to_interim(season: int, *, refresh: bool = False) -> Path:
     return out_dir
 
 
-def build_feature_tables(season: int) -> None:
-    """Precompute rolling aggregates that multiple feature groups share."""
-    raise NotImplementedError
+def _feature_outputs_for_season(season: int) -> list[Path]:
+    d = _season_dir(season)
+    return [
+        d / PLAYER_FEATURES_FILENAME,
+        d / TEAM_FEATURES_FILENAME,
+        d / SEASON_TO_DATE_FILENAME,
+    ]
 
 
-def interim_to_processed(splits: SplitSpec) -> dict[str, Path]:
-    """Join interim + features and emit the modeling-ready splits.
+def _features_up_to_date(season: int) -> bool:
+    """True iff feature outputs exist and are newer than the interim inputs.
 
-    Returns a dict with keys ``{"train","val","test"}`` mapping to parquet paths.
+    Inputs are the per-season ``games.parquet``, ``player_box.parquet``,
+    ``team_box.parquet`` — re-running raw_to_interim invalidates the
+    feature tables for that season.
     """
-    raise NotImplementedError
+    outputs = _feature_outputs_for_season(season)
+    if not all(p.exists() for p in outputs):
+        return False
+    oldest_output = min(p.stat().st_mtime for p in outputs)
+    d = _season_dir(season)
+    inputs = [d / GAMES_FILENAME, d / PLAYER_BOX_FILENAME, d / TEAM_BOX_FILENAME]
+    newest_input = _newest_mtime(inputs)
+    return oldest_output >= newest_input
+
+
+def build_feature_tables(season: int, *, refresh: bool = False) -> Path:
+    """Precompute rolling aggregates that multiple feature groups share.
+
+    Reads the per-season interim parquets and writes three feature tables
+    into the same season directory:
+
+        data/interim/<season>/player_features.parquet
+        data/interim/<season>/team_features.parquet
+        data/interim/<season>/season_to_date.parquet
+
+    The split layer (``interim_to_processed``) reads these and joins
+    matchup features (PLAN.md §3.1) on top. Materializing here means a
+    train/val/test re-split doesn't redo the per-season rolling work.
+
+    Idempotent: skips when outputs are newer than the interim inputs.
+    """
+    out_dir = _season_dir(season)
+    if not refresh and _features_up_to_date(season):
+        logger.info("features/%d up-to-date — skipping", season)
+        return out_dir
+
+    games_path = out_dir / GAMES_FILENAME
+    player_path = out_dir / PLAYER_BOX_FILENAME
+    team_path = out_dir / TEAM_BOX_FILENAME
+    # raw_to_interim must have produced these. If they're missing the user
+    # has the steps out of order; a clear FileNotFoundError beats a polars
+    # SchemaError later.
+    for p in (games_path, player_path, team_path):
+        if not p.exists():
+            raise FileNotFoundError(
+                f"build_feature_tables({season}): {p} not found — run raw_to_interim first"
+            )
+
+    games = pl.read_parquet(games_path)
+    player_box = pl.read_parquet(player_path)
+    team_box = pl.read_parquet(team_path)
+
+    player_features = player_rolling(player_box, games, team_box=team_box)
+    team_features = team_rolling(team_box, games)
+    std = season_to_date(player_box, games)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_parquet_atomic(player_features, out_dir / PLAYER_FEATURES_FILENAME)
+    _write_parquet_atomic(team_features, out_dir / TEAM_FEATURES_FILENAME)
+    _write_parquet_atomic(std, out_dir / SEASON_TO_DATE_FILENAME)
+
+    logger.info(
+        "features %d: wrote %d player rows, %d team rows, %d std rows",
+        season, player_features.height, team_features.height, std.height,
+    )
+    return out_dir
+
+
+# Columns we *don't* want to carry over from team_features into the joined
+# player frame — they either duplicate columns already on player_features
+# (date, season) or aren't useful at the player grain (team totals).
+_TEAM_FEATURE_KEEP_PREFIXES = ("t_",)
+_TEAM_FEATURE_KEEP_KEYS = ("game_id", "team_id")
+
+
+def _team_features_for_join(team_features: pl.DataFrame) -> pl.DataFrame:
+    """Subset team_features to (game_id, team_id, t_*) so the join doesn't
+    pull duplicate date/season/totals columns into the player frame."""
+    keep = [
+        c for c in team_features.columns
+        if c in _TEAM_FEATURE_KEEP_KEYS or c.startswith(_TEAM_FEATURE_KEEP_PREFIXES)
+    ]
+    return team_features.select(keep)
+
+
+def _build_split_frame(seasons: list[int]) -> pl.DataFrame:
+    """Read each season's feature tables, join team→player, concat.
+
+    Returns an empty DataFrame if ``seasons`` is empty (legal — the
+    config layer allows empty val/test splits)."""
+    if not seasons:
+        return pl.DataFrame()
+
+    parts: list[pl.DataFrame] = []
+    for season in sorted(seasons):
+        d = _season_dir(season)
+        pf_path = d / PLAYER_FEATURES_FILENAME
+        tf_path = d / TEAM_FEATURES_FILENAME
+        if not pf_path.exists() or not tf_path.exists():
+            raise FileNotFoundError(
+                f"season {season}: feature tables missing — run build_feature_tables({season}) first"
+            )
+        pf = pl.read_parquet(pf_path)
+        tf = pl.read_parquet(tf_path)
+        # Skip seasons that produced no rows (would happen only if every
+        # game in the season was dropped — pathological but defensible).
+        if pf.is_empty():
+            continue
+        joined = pf.join(
+            _team_features_for_join(tf),
+            on=["game_id", "team_id"],
+            how="left",
+        )
+        parts.append(joined)
+
+    if not parts:
+        return pl.DataFrame()
+    # vertical_relaxed accepts mild schema differences across seasons (e.g.
+    # an older season missing an advanced metric); strict vertical would
+    # blow up on a single null-dtype mismatch.
+    return pl.concat(parts, how="vertical_relaxed")
+
+
+def interim_to_processed(
+    splits: SplitSpec, *, refresh: bool = False
+) -> dict[str, Path]:
+    """Join interim + features per split and emit modeling-ready parquets.
+
+    For each split:
+        - Ensure ``build_feature_tables`` has run for every season in it.
+        - Read player_features and team_features, join team-rolling onto
+          each player row by (game_id, team_id).
+        - Concat across seasons, write ``data/processed/<split>.parquet``.
+
+    Returns a dict ``{"train": Path, "val": Path, "test": Path}`` (always
+    all three keys, even if a split is empty — the file is still written
+    so downstream code can rely on the path existing).
+
+    Note: matchup and context features (PLAN.md §3.1, ``features/matchup.py``
+    and ``features/context.py``) are not joined yet — they'll be wired in
+    once those modules are implemented. The processed parquet shape may
+    grow but never shrink as features land.
+    """
+    out_dir = processed_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ensure every season's feature tables are present (idempotent — the
+    # per-season function skips when up-to-date).
+    all_seasons = sorted(set(splits.train) | set(splits.val) | set(splits.test))
+    for season in all_seasons:
+        build_feature_tables(season, refresh=refresh)
+
+    paths = {
+        "train": out_dir / PROCESSED_TRAIN_FILENAME,
+        "val": out_dir / PROCESSED_VAL_FILENAME,
+        "test": out_dir / PROCESSED_TEST_FILENAME,
+    }
+    split_seasons = {"train": splits.train, "val": splits.val, "test": splits.test}
+
+    for split_name, season_list in split_seasons.items():
+        frame = _build_split_frame(season_list)
+        _write_parquet_atomic(frame, paths[split_name])
+        logger.info(
+            "processed/%s: %d rows from seasons %s",
+            split_name, frame.height, season_list,
+        )
+
+    return paths

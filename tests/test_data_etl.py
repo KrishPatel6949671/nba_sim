@@ -12,6 +12,10 @@ Covers:
     - ``_is_up_to_date`` (no outputs, outputs newer than inputs).
     - ``raw_to_interim`` happy path, short-game drop, fetch-failure drop,
       pair-mismatch drop, and incremental skip.
+    - ``build_feature_tables`` happy path, missing-interim, idempotent skip,
+      ``refresh=True`` rewrite.
+    - ``interim_to_processed`` writes all three split files, joins p_* and
+      t_* columns, auto-builds feature tables, handles empty splits.
 """
 
 from __future__ import annotations
@@ -658,3 +662,244 @@ def test_raw_to_interim_incremental_skip_and_refresh(
     raw_to_interim(2023, refresh=True)
     assert counts["games"] == first["games"] + 1
     assert counts["player"] == first["player"] + 1
+
+
+# ---------------------------------------------------------------------------
+# build_feature_tables / interim_to_processed
+#
+# These exercise the feature-derivation half of the pipeline. We bypass
+# raw_to_interim and seed the interim/<season>/ directory with synthetic
+# typed parquets directly — this isolates the feature stage from the
+# fetch/transform stage and keeps the tests fast.
+# ---------------------------------------------------------------------------
+
+import time
+import datetime as _dt
+
+from nba_sim.data.etl import (
+    SplitSpec,
+    build_feature_tables,
+    interim_to_processed,
+    processed_dir,
+)
+
+
+def _redirect_all_dirs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, Path]:
+    """interim + processed redirection. Tests that touch interim_to_processed
+    need both env vars set so the output never lands in the real repo."""
+    interim = tmp_path / "interim"
+    processed = tmp_path / "processed"
+    monkeypatch.setenv("NBA_SIM_INTERIM_DIR", str(interim))
+    monkeypatch.setenv("NBA_SIM_PROCESSED_DIR", str(processed))
+    return interim, processed
+
+
+def _seed_season_interim(season_dir: Path, season: int, *, n_games: int = 3) -> None:
+    """Write a small typed interim layout for one season. Two teams, two
+    players per team per game, regulation minutes, win/loss alternating
+    so plus_minus has both signs. Sufficient to drive rolling features
+    and surface any join breakage."""
+    season_dir.mkdir(parents=True, exist_ok=True)
+
+    dates = [_dt.date(season, 11, 1 + 2 * i) for i in range(n_games)]
+    games_rows: list[dict[str, Any]] = []
+    pb_rows: list[dict[str, Any]] = []
+    tb_rows: list[dict[str, Any]] = []
+    for i, d in enumerate(dates):
+        gid = f"{season}{i:04d}"
+        home_pts = 110 + i
+        away_pts = 105 + i
+        games_rows.append({
+            "game_id": gid, "season": season, "date": d,
+            "home_team_id": 1, "away_team_id": 2,
+            "home_team_abbr": "BOS", "away_team_abbr": "LAL",
+            "home_pts": home_pts, "away_pts": away_pts,
+            "is_overtime": False, "is_playoffs": False,
+            "dropped": False, "dropped_reason": None,
+        })
+        for team_id, abbr, pts, pm in [
+            (1, "BOS", home_pts, float(home_pts - away_pts)),
+            (2, "LAL", away_pts, float(away_pts - home_pts)),
+        ]:
+            tb_rows.append({
+                "game_id": gid, "team_id": team_id, "team_abbr": abbr,
+                "is_home": team_id == 1, "minutes": 240.0,
+                "pts": pts, "fgm": 40, "fga": 85, "tpm": 12, "tpa": 30,
+                "ftm": 18, "fta": 22, "oreb": 8, "dreb": 32, "reb": 40,
+                "ast": 22, "stl": 7, "blk": 4, "tov": 14, "pf": 18,
+                "plus_minus": pm,
+                "pace": 100.0 + i, "off_rtg": 110.0 + i, "def_rtg": 105.0 - i,
+            })
+            # Two players per team per game.
+            for slot, pid in enumerate(
+                (100, 101) if team_id == 1 else (200, 201)
+            ):
+                pb_rows.append({
+                    "game_id": gid, "player_id": pid, "player_name": f"P{pid}",
+                    "team_id": team_id, "team_abbr": abbr,
+                    "position": "G" if slot == 0 else "F",
+                    "minutes": 30.0 + i, "pts": 20 + i,
+                    "fgm": 8, "fga": 16, "tpm": 2, "tpa": 5,
+                    "ftm": 2, "fta": 3,
+                    "oreb": 1, "dreb": 5, "reb": 6,
+                    "ast": 4, "stl": 1, "blk": 0, "tov": 2, "pf": 3,
+                    "plus_minus": pm,
+                    "is_starter": slot == 0, "is_active": True, "dnp": False,
+                })
+
+    pl.DataFrame(games_rows).write_parquet(season_dir / etl.GAMES_FILENAME)
+    pl.DataFrame(pb_rows).write_parquet(season_dir / etl.PLAYER_BOX_FILENAME)
+    pl.DataFrame(tb_rows).write_parquet(season_dir / etl.TEAM_BOX_FILENAME)
+
+
+def test_build_feature_tables_writes_all_three_outputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    out = build_feature_tables(2022)
+    for fname in (
+        etl.PLAYER_FEATURES_FILENAME,
+        etl.TEAM_FEATURES_FILENAME,
+        etl.SEASON_TO_DATE_FILENAME,
+    ):
+        assert (out / fname).exists(), f"missing {fname}"
+
+    pf = pl.read_parquet(out / etl.PLAYER_FEATURES_FILENAME)
+    tf = pl.read_parquet(out / etl.TEAM_FEATURES_FILENAME)
+    std = pl.read_parquet(out / etl.SEASON_TO_DATE_FILENAME)
+
+    # Row counts: 3 games × 2 teams × 2 players = 12 player rows; 6 team rows.
+    assert pf.height == 12
+    assert tf.height == 6
+    assert std.height == 12
+
+    # Each output carries the expected feature prefix.
+    assert any(c.startswith("p_") for c in pf.columns)
+    assert any(c.startswith("t_") for c in tf.columns)
+    assert any(c.startswith("std_") for c in std.columns)
+
+
+def test_build_feature_tables_raises_when_interim_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A user who calls build_feature_tables before raw_to_interim should
+    get a clear FileNotFoundError naming the missing path."""
+    _redirect_all_dirs(monkeypatch, tmp_path)
+    with pytest.raises(FileNotFoundError, match="run raw_to_interim first"):
+        build_feature_tables(2022)
+
+
+def test_build_feature_tables_skips_when_up_to_date(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Second call must not rewrite — mtime should be unchanged."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    out = build_feature_tables(2022)
+    pf_path = out / etl.PLAYER_FEATURES_FILENAME
+    mtime_before = pf_path.stat().st_mtime
+
+    # Wait long enough that any rewrite would visibly change mtime.
+    time.sleep(0.05)
+    build_feature_tables(2022)
+    assert pf_path.stat().st_mtime == mtime_before
+
+
+def test_build_feature_tables_refresh_forces_rewrite(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    out = build_feature_tables(2022)
+    pf_path = out / etl.PLAYER_FEATURES_FILENAME
+    mtime_before = pf_path.stat().st_mtime
+
+    time.sleep(0.05)
+    build_feature_tables(2022, refresh=True)
+    assert pf_path.stat().st_mtime > mtime_before
+
+
+def test_interim_to_processed_writes_all_three_split_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interim, processed = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+    _seed_season_interim(interim / "2023", 2023)
+
+    spec = SplitSpec(train=[2022], val=[2023], test=[])
+    paths = interim_to_processed(spec)
+
+    assert set(paths) == {"train", "val", "test"}
+    for p in paths.values():
+        assert p.exists(), f"{p} should be written even if empty"
+
+    train = pl.read_parquet(paths["train"])
+    val = pl.read_parquet(paths["val"])
+    assert train.height == 12  # one season × 12 rows
+    assert val.height == 12
+
+
+def test_interim_to_processed_join_includes_both_player_and_team_features(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Joined frame must carry both p_* (player rolling) and t_* (team
+    rolling) columns — that's the whole point of the join."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    spec = SplitSpec(train=[2022], val=[], test=[])
+    paths = interim_to_processed(spec)
+    train = pl.read_parquet(paths["train"])
+
+    p_cols = [c for c in train.columns if c.startswith("p_")]
+    t_cols = [c for c in train.columns if c.startswith("t_")]
+    assert p_cols, "expected at least one p_* column in joined frame"
+    assert t_cols, "expected at least one t_* column in joined frame"
+
+
+def test_interim_to_processed_auto_builds_missing_feature_tables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If feature tables don't exist yet, interim_to_processed must call
+    build_feature_tables itself rather than crash."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+    # Sanity: features don't exist yet.
+    assert not (interim / "2022" / etl.PLAYER_FEATURES_FILENAME).exists()
+
+    spec = SplitSpec(train=[2022], val=[], test=[])
+    paths = interim_to_processed(spec)
+    # Features must now exist, AND the processed frame must be non-empty.
+    assert (interim / "2022" / etl.PLAYER_FEATURES_FILENAME).exists()
+    assert pl.read_parquet(paths["train"]).height > 0
+
+
+def test_interim_to_processed_empty_split_still_writes_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty val or test split must still produce a file on disk so
+    downstream code (DataLoader, evaluation) can rely on the path."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    spec = SplitSpec(train=[2022], val=[], test=[])
+    paths = interim_to_processed(spec)
+    assert paths["val"].exists()
+    assert paths["test"].exists()
+    assert pl.read_parquet(paths["val"]).is_empty()
+    assert pl.read_parquet(paths["test"]).is_empty()
+
+
+def test_processed_dir_respects_env_var(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same env-var-redirection pattern as interim_dir."""
+    custom = tmp_path / "custom_processed"
+    monkeypatch.setenv("NBA_SIM_PROCESSED_DIR", str(custom))
+    assert processed_dir() == custom.resolve()
