@@ -96,3 +96,4 @@ Thumbs.db
 #md
 PLAN.md
 prompt.md
+.env.example
