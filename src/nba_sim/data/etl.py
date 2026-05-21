@@ -44,6 +44,11 @@ from nba_sim.data.schema import (
     Roster,
     TeamBoxLine,
 )
+from nba_sim.features.context import add_context_features
+from nba_sim.features.matchup import (
+    add_matchup_features,
+    opponent_defrtg_by_position,
+)
 from nba_sim.features.rolling import (
     player_rolling,
     season_to_date,
@@ -532,8 +537,42 @@ def build_feature_tables(season: int, *, refresh: bool = False) -> Path:
     player_box = pl.read_parquet(player_path)
     team_box = pl.read_parquet(team_path)
 
-    player_features = player_rolling(player_box, games, team_box=team_box)
+    # Order matters: matchup features (opp rolling) read from team_features,
+    # so team_rolling must run first. player_rolling and team_rolling are
+    # independent; their order is just convention.
     team_features = team_rolling(team_box, games)
+    player_rolling_out = player_rolling(player_box, games, team_box=team_box)
+
+    # DefRtg-vs-position is a per-(opp_team, game, position) lookup table.
+    # We compute it once per season and pass it into add_matchup_features
+    # for the join — see opponent_defrtg_by_position docstring for why it's
+    # separate from add_matchup_features (different input dependencies).
+    defrtg_vs_pos = opponent_defrtg_by_position(player_box, games, team_box)
+
+    # Stitch matchup features onto the player rolling frame. The combined
+    # frame is what we persist as player_features.parquet — same grain
+    # (one row per player-game), now with opp_*/h2h_/opp_def_rtg_vs_pos
+    # columns added in.
+    player_features = add_matchup_features(
+        player_rolling_out, team_features, games, defrtg_vs_pos=defrtg_vs_pos
+    )
+
+    # Context features (rest, b2b, density, altitude, travel, calendar)
+    # are per-(team, game). Join onto player_features at (game_id, team_id)
+    # — every player on the team in that game shares the same context.
+    # We `.select` down to just the context-specific columns to avoid
+    # re-introducing identity columns (date, season, is_playoffs,
+    # team_abbr) that the player frame already carries.
+    context_features = add_context_features(games).select([
+        "game_id", "team_id",
+        "is_home", "rest_days", "b2b", "is_3in4", "is_4in6",
+        "season_phase", "day_of_week", "month",
+        "altitude_ft", "travel_miles_prev",
+    ])
+    player_features = player_features.join(
+        context_features, on=["game_id", "team_id"], how="left"
+    )
+
     std = season_to_date(player_box, games)
 
     out_dir.mkdir(parents=True, exist_ok=True)

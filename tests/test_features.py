@@ -1,27 +1,47 @@
 """Feature-engineering tests.
 
-Covers the implemented surface of ``features/rolling.py``:
+Covers ``features/rolling.py``, ``features/matchup.py``, and
+``features/context.py``:
 
-    - ``player_rolling``: shape, correctness against hand-computed values,
-      leakage safety (first row null, cross-player independence, dropped
+    - ``player_rolling`` / ``team_rolling`` / ``season_to_date``:
+      shape, correctness against hand-computed values, leakage safety
+      (first row null, cross-player and cross-team independence, dropped
       games excluded), optional USG% via ``team_box``, season-reset of
-      game-count counter while still letting form cross seasons.
-    - ``team_rolling``: rolling means, win-pct derivation from plus-minus,
-      points-allowed derivation.
-    - ``season_to_date``: prior-only cumulative averages, season reset.
-
-The context/matchup stubs remain ``pytest.skip`` until those modules land
-(PLAN.md §3.1 Phase 1).
+      counters while still letting rolling form cross seasons.
+    - ``head_to_head_last_margin``: first-meeting 0; sign-anchoring when
+      venues swap; uses *most recent* prior meeting not first; isolated
+      across team pairs; dropped games excluded.
+    - ``opponent_defrtg_by_position``: first-game null; cumulative-prior
+      values; position="" excluded; season reset.
+    - ``add_matchup_features``: join shape, opp_team_id correctness,
+      h2h null-fill to 0, defrtg_vs_pos optional, dropped-game rows
+      filtered.
+    - ``arena_altitude`` / ``travel_distance_miles`` / scalar haversine.
+    - ``add_context_features``: per-(team, game) fan-out, rest/b2b/density,
+      season_phase (playoffs override), day-of-week zero-indexing,
+      altitude/travel joins, cross-season reset, dropped-game filter.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import math
 from typing import Any
 
 import polars as pl
 import pytest
 
+from nba_sim.features.context import (
+    _haversine_miles,
+    add_context_features,
+    arena_altitude,
+    travel_distance_miles,
+)
+from nba_sim.features.matchup import (
+    add_matchup_features,
+    head_to_head_last_margin,
+    opponent_defrtg_by_position,
+)
 from nba_sim.features.rolling import (
     PLAYER_WINDOWS,
     TEAM_WINDOWS,
@@ -551,20 +571,741 @@ def test_no_future_date_contributes_to_any_rolling_value() -> None:
 
 
 # ===========================================================================
-# Not-yet-implemented features (context / matchup).
+# Matchup helpers and shared fixtures
 # ===========================================================================
 
-def test_context_rest_days_computed_correctly() -> None:
-    pytest.skip("features/context.py not implemented")
+def _full_game(
+    gid: str,
+    date: dt.date,
+    season: int,
+    *,
+    home_team_id: int,
+    away_team_id: int,
+    home_pts: int,
+    away_pts: int,
+    home_team_abbr: str = "BOS",
+    away_team_abbr: str = "LAL",
+    is_playoffs: bool = False,
+    dropped: bool = False,
+) -> dict[str, Any]:
+    """Game row carrying the home/away team IDs, abbreviations, points,
+    and playoff flag that matchup *and* context features read. ``_game()``
+    (used by rolling tests) omits these — kept separate so the rolling-only
+    tests stay terse.
+
+    Default abbreviations (BOS/LAL) and ``is_playoffs=False`` mean the
+    pre-existing matchup tests that don't pass these kwargs continue to
+    work — the extra columns are simply ignored by matchup functions.
+    """
+    return {
+        "game_id": gid, "date": date, "season": season,
+        "home_team_id": home_team_id, "away_team_id": away_team_id,
+        "home_team_abbr": home_team_abbr, "away_team_abbr": away_team_abbr,
+        "home_pts": home_pts, "away_pts": away_pts,
+        "is_playoffs": is_playoffs,
+        "dropped": dropped,
+    }
 
 
-def test_b2b_flag_correct_on_consecutive_dates() -> None:
-    pytest.skip("features/context.py not implemented")
+# ===========================================================================
+# head_to_head_last_margin
+# ===========================================================================
+
+def test_h2h_returns_empty_for_empty_input() -> None:
+    out = head_to_head_last_margin(pl.DataFrame())
+    assert out.is_empty()
 
 
-def test_opp_defrtg_uses_opponent_prior_games_only() -> None:
-    pytest.skip("features/matchup.py not implemented")
+def test_h2h_first_meeting_is_zero() -> None:
+    """No prior meeting → margin must be 0 (PLAN §3.1 contract)."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+    ])
+    out = head_to_head_last_margin(games)
+    assert out["h2h_last_meeting_margin"][0] == 0.0
 
+
+def test_h2h_second_meeting_same_venue_preserves_sign() -> None:
+    """BOS hosted both meetings. Prior margin from BOS POV = +10. Current
+    home is still BOS, so the value should remain +10."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 2, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=112, away_pts=108),
+    ])
+    out = head_to_head_last_margin(games)
+    g2 = out.filter(pl.col("game_id") == "G2").row(0, named=True)
+    assert g2["h2h_last_meeting_margin"] == 10.0
+
+
+def test_h2h_second_meeting_swapped_venue_flips_sign() -> None:
+    """Venue swap is the key correctness test: the prior margin's sign
+    must flip to reflect the *current* home team's POV.
+
+    G1: BOS home, BOS won by 10 (BOS's margin = +10).
+    G2: LAL home — now we're asking from LAL's perspective, so margin = -10.
+    Naive "prev_home_pts - prev_away_pts" would emit +10 (wrong sign).
+    """
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 2, 1), 2022,
+                   home_team_id=2, away_team_id=1, home_pts=115, away_pts=108),
+    ])
+    out = head_to_head_last_margin(games)
+    g2 = out.filter(pl.col("game_id") == "G2").row(0, named=True)
+    assert g2["h2h_last_meeting_margin"] == -10.0
+
+
+def test_h2h_uses_most_recent_meeting_not_first() -> None:
+    """Three meetings; G3 should see G2's margin, not G1's."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 2, 1), 2022,
+                   home_team_id=2, away_team_id=1, home_pts=115, away_pts=108),
+        _full_game("G3", dt.date(2023, 3, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=120, away_pts=110),
+    ])
+    out = head_to_head_last_margin(games)
+    g3 = out.filter(pl.col("game_id") == "G3").row(0, named=True)
+    # G2: LAL won by 7. Current home is BOS, so flip → -7.
+    assert g3["h2h_last_meeting_margin"] == -7.0
+
+
+def test_h2h_isolates_team_pairs() -> None:
+    """A BOS-CHI game cannot pollute the BOS-LAL h2h chain."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("G_OTHER", dt.date(2023, 1, 10), 2022,
+                   home_team_id=1, away_team_id=3, home_pts=130, away_pts=80),
+        _full_game("G2", dt.date(2023, 2, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=112, away_pts=108),
+    ])
+    out = head_to_head_last_margin(games)
+    # BOS-CHI is a first meeting too → 0.
+    assert out.filter(pl.col("game_id") == "G_OTHER")["h2h_last_meeting_margin"][0] == 0.0
+    # BOS-LAL G2 sees G1, not G_OTHER's blowout.
+    assert out.filter(pl.col("game_id") == "G2")["h2h_last_meeting_margin"][0] == 10.0
+
+
+def test_h2h_excludes_dropped_games() -> None:
+    """A dropped prior meeting must not contribute to the chain."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_pts=999, away_pts=0, dropped=True),
+        _full_game("G2", dt.date(2023, 2, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=112, away_pts=108),
+    ])
+    out = head_to_head_last_margin(games)
+    # G2 should see no prior meeting because G1 was dropped.
+    assert "G1" not in out["game_id"].to_list()  # dropped row absent
+    assert out.filter(pl.col("game_id") == "G2")["h2h_last_meeting_margin"][0] == 0.0
+
+
+# ===========================================================================
+# opponent_defrtg_by_position
+# ===========================================================================
+
+def _matchup_setup_two_games() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Two BOS-LAL games with two starters per team per game. Used by
+    multiple position-matchup tests so the hand-computed expectations stay
+    consistent."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 10), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=115, away_pts=105),
+    ])
+    # Both starters at G and F per team. LAL's G scores 20, LAL's F scores 15.
+    player_box = pl.DataFrame([
+        # G1
+        _pbox_row("G1", 100, 1, pts=25),  # BOS G
+        _pbox_row("G1", 101, 1, pts=18),  # BOS F (we'll override position)
+        _pbox_row("G1", 200, 2, pts=20),  # LAL G
+        _pbox_row("G1", 201, 2, pts=15),  # LAL F
+        # G2
+        _pbox_row("G2", 100, 1, pts=22),
+        _pbox_row("G2", 101, 1, pts=20),
+        _pbox_row("G2", 200, 2, pts=24),
+        _pbox_row("G2", 201, 2, pts=17),
+    ]).with_columns(
+        pl.when(pl.col("player_id").is_in([100, 200])).then(pl.lit("G"))
+        .otherwise(pl.lit("F"))
+        .alias("position")
+    )
+    team_box = pl.DataFrame([
+        _tbox_row("G1", 1, pace=100.0), _tbox_row("G1", 2, pace=100.0),
+        _tbox_row("G2", 1, pace=100.0), _tbox_row("G2", 2, pace=100.0),
+    ])
+    return games, player_box, team_box
+
+
+def test_opp_defrtg_by_pos_returns_empty_for_empty_input() -> None:
+    out = opponent_defrtg_by_position(pl.DataFrame(), pl.DataFrame(), pl.DataFrame())
+    assert out.is_empty()
+
+
+def test_opp_defrtg_by_pos_first_game_is_null() -> None:
+    """First game in season → no prior possessions → cum_poss_prior=0 → None."""
+    games, pb, tb = _matchup_setup_two_games()
+    out = opponent_defrtg_by_position(pb, games, tb)
+    g1 = out.filter(pl.col("game_id") == "G1")
+    assert g1.height > 0
+    for v in g1["opp_def_rtg_vs_pos"]:
+        assert v is None
+
+
+def test_opp_defrtg_by_pos_second_game_is_hand_computed() -> None:
+    """G2: opp=BOS (team 1). LAL's G scored 20 at G1; LAL's F scored 15.
+    BOS's pace at G1 = 100. So:
+        opp_def_rtg_vs_pos(opp=BOS, G2, G) = 100 * 20 / 100 = 20.0
+        opp_def_rtg_vs_pos(opp=BOS, G2, F) = 100 * 15 / 100 = 15.0
+
+    And opp=LAL at G2: BOS's G scored 25, BOS's F scored 18; LAL's pace=100.
+        opp_def_rtg_vs_pos(opp=LAL, G2, G) = 25.0
+        opp_def_rtg_vs_pos(opp=LAL, G2, F) = 18.0
+    """
+    games, pb, tb = _matchup_setup_two_games()
+    out = opponent_defrtg_by_position(pb, games, tb)
+    g2 = out.filter(pl.col("game_id") == "G2")
+    by_key = {(r["opp_team_id"], r["position"]): r["opp_def_rtg_vs_pos"]
+              for r in g2.iter_rows(named=True)}
+    assert by_key[(1, "G")] == pytest.approx(20.0)
+    assert by_key[(1, "F")] == pytest.approx(15.0)
+    assert by_key[(2, "G")] == pytest.approx(25.0)
+    assert by_key[(2, "F")] == pytest.approx(18.0)
+
+
+def test_opp_defrtg_by_pos_excludes_empty_position() -> None:
+    """A player with position="" (non-starter) must not appear in the
+    output and must not contribute to any (opp_team, position) bucket."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 10), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=115, away_pts=105),
+    ])
+    # LAL's "G" player scores 20, LAL's "" player (off bench) scores 50.
+    # If filtering works, only the G=20 contribution should appear.
+    pb = pl.DataFrame([
+        _pbox_row("G1", 100, 1, pts=10),
+        _pbox_row("G1", 200, 2, pts=20),
+        _pbox_row("G1", 201, 2, pts=50),
+        _pbox_row("G2", 100, 1, pts=10),
+        _pbox_row("G2", 200, 2, pts=20),
+    ]).with_columns(
+        pl.when(pl.col("player_id") == 100).then(pl.lit("G"))
+        .when(pl.col("player_id") == 200).then(pl.lit("G"))
+        .otherwise(pl.lit(""))
+        .alias("position")
+    )
+    tb = pl.DataFrame([
+        _tbox_row("G1", 1), _tbox_row("G1", 2),
+        _tbox_row("G2", 1), _tbox_row("G2", 2),
+    ])
+    out = opponent_defrtg_by_position(pb, games, tb)
+    # No "" rows ever appear.
+    assert "" not in out["position"].to_list()
+    # And the G2 value for opp=BOS, pos=G uses only the position=G data
+    # from G1 (pts=20), not the 50 from position="".
+    g2_bos_g = out.filter(
+        (pl.col("game_id") == "G2") & (pl.col("opp_team_id") == 1) & (pl.col("position") == "G")
+    ).row(0, named=True)
+    assert g2_bos_g["opp_def_rtg_vs_pos"] == pytest.approx(20.0)
+
+
+def test_opp_defrtg_by_pos_resets_across_seasons() -> None:
+    """A new season starts with cum_poss_prior=0 again. The carried-over
+    point totals from last season must not leak into this season's rating."""
+    games = pl.DataFrame([
+        _full_game("S1G1", dt.date(2022, 12, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("S2G1", dt.date(2023, 10, 1), 2023,
+                   home_team_id=1, away_team_id=2, home_pts=112, away_pts=108),
+    ])
+    pb = pl.DataFrame([
+        _pbox_row("S1G1", 100, 1, pts=25),
+        _pbox_row("S1G1", 200, 2, pts=30),
+        _pbox_row("S2G1", 100, 1, pts=22),
+        _pbox_row("S2G1", 200, 2, pts=20),
+    ]).with_columns(pl.lit("G").alias("position"))
+    tb = pl.DataFrame([
+        _tbox_row("S1G1", 1), _tbox_row("S1G1", 2),
+        _tbox_row("S2G1", 1), _tbox_row("S2G1", 2),
+    ])
+    out = opponent_defrtg_by_position(pb, games, tb)
+    # S2G1 is the FIRST game of the new season → null.
+    s2 = out.filter(pl.col("game_id") == "S2G1")
+    for v in s2["opp_def_rtg_vs_pos"]:
+        assert v is None
+
+
+# ===========================================================================
+# add_matchup_features
+# ===========================================================================
+
+def test_add_matchup_features_returns_empty_for_empty_input() -> None:
+    out = add_matchup_features(
+        pl.DataFrame(), pl.DataFrame(), pl.DataFrame(), defrtg_vs_pos=None,
+    )
+    assert out.is_empty()
+
+
+def test_add_matchup_features_attaches_opp_team_id() -> None:
+    """The most fundamental contract: every player row must learn who its
+    opponent was. BOS players → opp_team_id=2, LAL players → opp_team_id=1."""
+    games, pb, tb = _matchup_setup_two_games()
+    tr = team_rolling(tb, games)
+    pr = player_rolling(pb, games, team_box=tb)
+    out = add_matchup_features(pr, tr, games)
+    for r in out.iter_rows(named=True):
+        expected_opp = 2 if r["team_id"] == 1 else 1
+        assert r["opp_team_id"] == expected_opp
+
+
+def test_add_matchup_features_joins_opp_rolling() -> None:
+    """opp_def_rtg_10 for a BOS player at G2 = LAL's t_def_rtg_10 at G2
+    (i.e. LAL's def_rtg from their games before G2 — just G1)."""
+    games, pb, tb = _matchup_setup_two_games()
+    tr = team_rolling(tb, games)
+    pr = player_rolling(pb, games, team_box=tb)
+    out = add_matchup_features(pr, tr, games)
+    bos_at_g2 = out.filter(
+        (pl.col("game_id") == "G2") & (pl.col("team_id") == 1)
+    ).row(0, named=True)
+    lal_def_rtg_g1 = (
+        tb.filter((pl.col("team_id") == 2) & (pl.col("game_id") == "G1"))["def_rtg"][0]
+    )
+    assert bos_at_g2["opp_def_rtg_10"] == pytest.approx(lal_def_rtg_g1)
+
+
+def test_add_matchup_features_h2h_fills_null_with_zero() -> None:
+    """First meetings produce null pre-join (no row in h2h table for that
+    game_id). The function must fill with 0 per PLAN.md §3.1."""
+    games, pb, tb = _matchup_setup_two_games()
+    tr = team_rolling(tb, games)
+    pr = player_rolling(pb, games, team_box=tb)
+    out = add_matchup_features(pr, tr, games)
+    g1_h2h = out.filter(pl.col("game_id") == "G1")["h2h_last_meeting_margin"].unique().to_list()
+    assert g1_h2h == [0.0]
+
+
+def test_add_matchup_features_position_join_optional() -> None:
+    """When defrtg_vs_pos is None, the column simply isn't there."""
+    games, pb, tb = _matchup_setup_two_games()
+    tr = team_rolling(tb, games)
+    pr = player_rolling(pb, games, team_box=tb)
+    out_without = add_matchup_features(pr, tr, games, defrtg_vs_pos=None)
+    assert "opp_def_rtg_vs_pos" not in out_without.columns
+
+    dvp = opponent_defrtg_by_position(pb, games, tb)
+    out_with = add_matchup_features(pr, tr, games, defrtg_vs_pos=dvp)
+    assert "opp_def_rtg_vs_pos" in out_with.columns
+
+
+def test_add_matchup_features_drops_player_rows_for_dropped_games() -> None:
+    """A player row whose game is flagged dropped has no entry in the
+    opponent map (the map filters on ~dropped). The inner join drops it."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("G_BAD", dt.date(2023, 1, 10), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=999, away_pts=0,
+                   dropped=True),
+    ])
+    pb = pl.DataFrame([
+        _pbox_row("G1", 100, 1),
+        _pbox_row("G_BAD", 100, 1),
+    ])
+    tb = pl.DataFrame([
+        _tbox_row("G1", 1), _tbox_row("G1", 2),
+        _tbox_row("G_BAD", 1), _tbox_row("G_BAD", 2),
+    ])
+    # rolling itself doesn't see the dropped row (it filters too), so feed
+    # it the raw player_box and check that the matchup join drops the bad row.
+    pr = pb  # use raw, bypass rolling for this test
+    tr = team_rolling(tb, games)
+    out = add_matchup_features(pr, tr, games)
+    assert "G_BAD" not in out["game_id"].to_list()
+
+
+def test_add_matchup_features_row_count_preserved() -> None:
+    """No row explosion: input row count == output row count when all
+    player rows belong to non-dropped games."""
+    games, pb, tb = _matchup_setup_two_games()
+    tr = team_rolling(tb, games)
+    pr = player_rolling(pb, games, team_box=tb)
+    out = add_matchup_features(pr, tr, games)
+    assert out.height == pr.height
+
+
+# ===========================================================================
+# context.py — scalar arena lookups and haversine
+# ===========================================================================
+
+def test_arena_altitude_known_teams() -> None:
+    """Spot-check the major altitude outliers and a sea-level team."""
+    assert arena_altitude("DEN") == pytest.approx(5280.0)  # Mile High
+    assert arena_altitude("UTA") == pytest.approx(4226.0)
+    assert arena_altitude("BOS") == pytest.approx(20.0)
+
+
+def test_arena_altitude_unknown_returns_default() -> None:
+    """Quiet fallback to ~sea level — minimizes the altitude signal
+    on a typo rather than crashing mid-pipeline."""
+    assert arena_altitude("XYZ") == 50.0
+    assert arena_altitude("") == 50.0
+
+
+def test_travel_distance_same_arena_is_zero() -> None:
+    """LAL and LAC share Crypto.com Arena — distance must be exactly 0."""
+    assert travel_distance_miles("LAL", "LAC") == 0.0
+    assert travel_distance_miles("LAC", "LAL") == 0.0
+
+
+def test_travel_distance_symmetric() -> None:
+    """Great-circle distance is symmetric. Polars 1.17 uses arcsin form
+    while the Python scalar uses atan2 — symmetry catches any drift."""
+    a = travel_distance_miles("BOS", "DEN")
+    b = travel_distance_miles("DEN", "BOS")
+    assert a == pytest.approx(b)
+    # Sanity bound: BOS<->DEN great-circle is ~1750 mi.
+    assert 1500 < a < 2000
+
+
+def test_travel_distance_known_pair_approx() -> None:
+    """Catch obvious lat/lng typos: NYK-BOS is famously ~190 mi."""
+    d = travel_distance_miles("NYK", "BOS")
+    assert 180 < d < 200, f"NYK->BOS = {d}, expected ~190"
+
+
+def test_travel_distance_unknown_returns_nan() -> None:
+    """No sensible default for distance — surface unknowns loudly."""
+    assert math.isnan(travel_distance_miles("ZZZ", "BOS"))
+    assert math.isnan(travel_distance_miles("BOS", "ZZZ"))
+
+
+def test_haversine_to_self_is_zero() -> None:
+    assert _haversine_miles(42.0, -71.0, 42.0, -71.0) == 0.0
+
+
+# ===========================================================================
+# add_context_features
+# ===========================================================================
+
+def test_add_context_features_returns_empty_for_empty_input() -> None:
+    out = add_context_features(pl.DataFrame())
+    assert out.is_empty()
+
+
+def test_add_context_fans_out_one_row_per_team_per_game() -> None:
+    """Each game produces two rows, one per team, with the correct
+    ``is_home`` flag on each side."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+    ])
+    out = add_context_features(games)
+    assert out.height == 2
+    assert set(out["team_id"].to_list()) == {1, 2}
+    by_tid = {r["team_id"]: r for r in out.iter_rows(named=True)}
+    assert by_tid[1]["is_home"] is True
+    assert by_tid[2]["is_home"] is False
+
+
+def test_add_context_schedule_features_null_on_first_game() -> None:
+    """First game of a (team, season) has no prior → all shift-based
+    features are null. ``altitude_ft`` and ``is_home`` are not history-
+    dependent, so they're populated."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+    ])
+    out = add_context_features(games)
+    for r in out.iter_rows(named=True):
+        assert r["rest_days"] is None
+        assert r["b2b"] is None
+        assert r["is_3in4"] is None
+        assert r["is_4in6"] is None
+        assert r["travel_miles_prev"] is None
+        # But identity / pure-row features are still populated.
+        assert r["altitude_ft"] is not None
+        assert r["day_of_week"] is not None
+
+
+def test_add_context_b2b_true_on_consecutive_days() -> None:
+    """Played yesterday → gap=1 → rest_days=0, b2b=True. Verifies the
+    "nights of rest" convention (rest_days = gap - 1)."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 2), 2022,
+                   home_team_id=1, away_team_id=3,
+                   home_team_abbr="BOS", away_team_abbr="CHI",
+                   home_pts=105, away_pts=100),
+    ])
+    out = add_context_features(games).sort(["team_id", "date"])
+    bos_g2 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G2")).row(0, named=True)
+    assert bos_g2["b2b"] is True
+    assert bos_g2["rest_days"] == 0
+
+
+def test_add_context_rest_days_clipped_at_5() -> None:
+    """Long gap (18 days) → rest_days clipped to 5, not 17. b2b False."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 20), 2022,
+                   home_team_id=1, away_team_id=3,
+                   home_team_abbr="BOS", away_team_abbr="CHI",
+                   home_pts=105, away_pts=100),
+    ])
+    out = add_context_features(games).sort(["team_id", "date"])
+    bos_g2 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G2")).row(0, named=True)
+    assert bos_g2["rest_days"] == 5
+    assert bos_g2["b2b"] is False
+
+
+def test_add_context_is_3in4_true_for_three_games_in_four_days() -> None:
+    """Jan 1 → Jan 3 → Jan 4 is 3 games spanning 4 days; the third game
+    has gap_2back = 3 ≤ 3 → is_3in4 True."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 3), 2022,
+                   home_team_id=1, away_team_id=3,
+                   home_team_abbr="BOS", away_team_abbr="CHI",
+                   home_pts=105, away_pts=100),
+        _full_game("G3", dt.date(2023, 1, 4), 2022,
+                   home_team_id=1, away_team_id=4,
+                   home_team_abbr="BOS", away_team_abbr="MIA",
+                   home_pts=120, away_pts=110),
+    ])
+    out = add_context_features(games).sort(["team_id", "date"])
+    bos_g3 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G3")).row(0, named=True)
+    assert bos_g3["is_3in4"] is True
+    # And the boundary case the test could miss: 4-day spans of 5+ shouldn't
+    # trigger. Build that explicitly:
+    games2 = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 3), 2022,
+                   home_team_id=1, away_team_id=3,
+                   home_team_abbr="BOS", away_team_abbr="CHI",
+                   home_pts=105, away_pts=100),
+        _full_game("G3", dt.date(2023, 1, 5), 2022,
+                   home_team_id=1, away_team_id=4,
+                   home_team_abbr="BOS", away_team_abbr="MIA",
+                   home_pts=120, away_pts=110),
+    ])
+    # 3 games across 5 calendar days (Jan 1-5) — NOT 3in4.
+    out2 = add_context_features(games2).sort(["team_id", "date"])
+    bos2 = out2.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G3")).row(0, named=True)
+    assert bos2["is_3in4"] is False
+
+
+def test_add_context_is_4in6_true_for_four_games_in_six_days() -> None:
+    """Jan 1, 2, 4, 6: gap_3back = 5 ≤ 5 → is_4in6 True."""
+    games = pl.DataFrame([
+        _full_game(f"G{i+1}", date, 2022,
+                   home_team_id=1, away_team_id=10 + i,
+                   home_team_abbr="BOS", away_team_abbr=opp,
+                   home_pts=100, away_pts=95)
+        for i, (date, opp) in enumerate([
+            (dt.date(2023, 1, 1), "LAL"),
+            (dt.date(2023, 1, 2), "CHI"),
+            (dt.date(2023, 1, 4), "MIA"),
+            (dt.date(2023, 1, 6), "PHI"),
+        ])
+    ])
+    out = add_context_features(games).sort(["team_id", "date"])
+    bos_g4 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G4")).row(0, named=True)
+    assert bos_g4["is_4in6"] is True
+
+
+def test_add_context_season_phase_playoffs_takes_precedence() -> None:
+    """is_playoffs=True overrides the month-bucket rule. A May game with
+    is_playoffs=False would be 'late'; with True it must be 'playoffs'."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 5, 15), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100,
+                   is_playoffs=True),
+    ])
+    out = add_context_features(games)
+    for r in out.iter_rows(named=True):
+        assert r["season_phase"] == "playoffs"
+
+
+@pytest.mark.parametrize(
+    ("month", "phase"),
+    [
+        (10, "early"), (11, "early"),
+        (12, "mid"),   (1, "mid"),   (2, "mid"),
+        (3, "late"),   (4, "late"),
+    ],
+)
+def test_add_context_season_phase_by_month(month: int, phase: str) -> None:
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, month, 15), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100,
+                   is_playoffs=False),
+    ])
+    out = add_context_features(games)
+    for r in out.iter_rows(named=True):
+        assert r["season_phase"] == phase
+
+
+def test_add_context_day_of_week_zero_indexed_monday() -> None:
+    """PLAN says day_of_week is 0..6. Polars' dt.weekday() returns 1..7
+    with Mon=1, so the function subtracts 1. Jan 1 2023 was Sunday."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,  # Sun
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 2), 2022,  # Mon
+                   home_team_id=1, away_team_id=3,
+                   home_team_abbr="BOS", away_team_abbr="CHI",
+                   home_pts=105, away_pts=100),
+    ])
+    out = add_context_features(games).sort(["team_id", "date"])
+    g1 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G1")).row(0, named=True)
+    g2 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G2")).row(0, named=True)
+    assert g1["day_of_week"] == 6  # Sunday
+    assert g2["day_of_week"] == 0  # Monday
+
+
+def test_add_context_month_matches_date() -> None:
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 3, 15), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+    ])
+    out = add_context_features(games)
+    for r in out.iter_rows(named=True):
+        assert r["month"] == 3
+
+
+def test_add_context_altitude_known_and_unknown() -> None:
+    """Known team gets its real altitude; unknown abbr falls back to 50."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=99,
+                   home_team_abbr="DEN", away_team_abbr="???",
+                   home_pts=110, away_pts=100),
+    ])
+    out = add_context_features(games)
+    den = out.filter(pl.col("team_abbr") == "DEN").row(0, named=True)
+    unk = out.filter(pl.col("team_abbr") == "???").row(0, named=True)
+    assert den["altitude_ft"] == pytest.approx(5280.0)
+    assert unk["altitude_ft"] == 50.0
+
+
+def test_add_context_travel_zero_when_staying_at_same_arena() -> None:
+    """Two home games in a row → previous arena == current arena → 0 miles."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 3), 2022,
+                   home_team_id=1, away_team_id=3,
+                   home_team_abbr="BOS", away_team_abbr="CHI",
+                   home_pts=105, away_pts=100),
+    ])
+    out = add_context_features(games).sort(["team_id", "date"])
+    bos_g2 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G2")).row(0, named=True)
+    assert bos_g2["travel_miles_prev"] == 0.0
+
+
+def test_add_context_travel_road_trip_distance() -> None:
+    """BOS home, then BOS at NYK → travel ~190 mi (the canonical NE-corridor
+    great-circle). Pinned only to a window to allow lat/lng refinement."""
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 3), 2022,
+                   home_team_id=20, away_team_id=1,
+                   home_team_abbr="NYK", away_team_abbr="BOS",
+                   home_pts=105, away_pts=100),
+    ])
+    out = add_context_features(games).sort(["team_id", "date"])
+    bos_g2 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "G2")).row(0, named=True)
+    assert 180 < bos_g2["travel_miles_prev"] < 200
+
+
+def test_add_context_cross_season_reset() -> None:
+    """First game of a new season — even with a prior-season game in the
+    same frame — gets null rest/b2b/density/travel. The summer break
+    must not masquerade as a multi-month rest streak."""
+    games = pl.DataFrame([
+        _full_game("S1G1", dt.date(2022, 12, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+        _full_game("S2G1", dt.date(2023, 10, 15), 2023,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+    ])
+    out = add_context_features(games).sort(["team_id", "date"])
+    s2 = out.filter((pl.col("team_id") == 1) & (pl.col("game_id") == "S2G1")).row(0, named=True)
+    assert s2["rest_days"] is None
+    assert s2["b2b"] is None
+    assert s2["is_3in4"] is None
+    assert s2["is_4in6"] is None
+    assert s2["travel_miles_prev"] is None
+
+
+def test_add_context_excludes_dropped_games() -> None:
+    """A dropped row must not appear in the output AND must not contribute
+    to the next game's shift-based features. Otherwise a fake game's
+    date would corrupt rest_days for the next real game."""
+    games = pl.DataFrame([
+        _full_game("G_BAD", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=999, away_pts=0,
+                   dropped=True),
+        _full_game("G1", dt.date(2023, 1, 5), 2022,
+                   home_team_id=1, away_team_id=2,
+                   home_team_abbr="BOS", away_team_abbr="LAL",
+                   home_pts=110, away_pts=100),
+    ])
+    out = add_context_features(games)
+    assert "G_BAD" not in out["game_id"].to_list()
+    # G1 is now effectively the team's first game → null shift features.
+    g1 = out.filter(pl.col("game_id") == "G1").row(0, named=True)
+    assert g1["rest_days"] is None
+
+
+# ===========================================================================
+# Not-yet-implemented features
+# ===========================================================================
 
 def test_cold_start_player_feature_is_nan_filled() -> None:
     pytest.skip("cold-start fill handled in §7 simulator, not in rolling")

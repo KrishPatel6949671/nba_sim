@@ -13,9 +13,10 @@ Covers:
     - ``raw_to_interim`` happy path, short-game drop, fetch-failure drop,
       pair-mismatch drop, and incremental skip.
     - ``build_feature_tables`` happy path, missing-interim, idempotent skip,
-      ``refresh=True`` rewrite.
-    - ``interim_to_processed`` writes all three split files, joins p_* and
-      t_* columns, auto-builds feature tables, handles empty splits.
+      ``refresh=True`` rewrite, and matchup columns wired in.
+    - ``interim_to_processed`` writes all three split files, joins p_*, t_*,
+      and opp_*/h2h_* columns, auto-builds feature tables, handles empty
+      splits.
 """
 
 from __future__ import annotations
@@ -903,3 +904,150 @@ def test_processed_dir_respects_env_var(
     custom = tmp_path / "custom_processed"
     monkeypatch.setenv("NBA_SIM_PROCESSED_DIR", str(custom))
     assert processed_dir() == custom.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Matchup feature wiring — these guard the pipeline contract that
+# build_feature_tables fans matchup columns into player_features.parquet
+# and that interim_to_processed carries them through. Hand-computed
+# correctness lives in test_features.py; here we check only flow-through.
+# ---------------------------------------------------------------------------
+
+# Columns the matchup module contributes to player_features. Pulled from
+# the matchup function's public surface so the test moves in lockstep if
+# the column set changes.
+_MATCHUP_COLS = {
+    "opp_team_id",
+    "opp_def_rtg_10",
+    "opp_pace_10",
+    "h2h_last_meeting_margin",
+    "opp_def_rtg_vs_pos",
+}
+
+
+def test_build_feature_tables_writes_matchup_columns_into_player_features(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """player_features.parquet must carry opp_*, h2h_*, opp_def_rtg_vs_pos
+    after build_feature_tables runs. This is the wiring contract — if the
+    matchup call gets dropped from build_feature_tables, this fails."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    build_feature_tables(2022)
+    pf = pl.read_parquet(interim / "2022" / etl.PLAYER_FEATURES_FILENAME)
+    missing = _MATCHUP_COLS - set(pf.columns)
+    assert not missing, f"player_features missing matchup cols: {sorted(missing)}"
+
+
+def test_build_feature_tables_matchup_values_present_after_first_game(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Sanity check that the matchup values are *populated* (non-null) for
+    games past the first one. We don't pin specific numbers here — the
+    arithmetic is locked down in test_features.py — but we do verify the
+    null/non-null pattern that signals the join actually happened."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    # 3 games so we have a non-trivial prior-history window.
+    _seed_season_interim(interim / "2022", 2022, n_games=3)
+
+    build_feature_tables(2022)
+    pf = pl.read_parquet(interim / "2022" / etl.PLAYER_FEATURES_FILENAME)
+
+    games = pl.read_parquet(interim / "2022" / etl.GAMES_FILENAME).sort("date")
+    first_gid = games["game_id"][0]
+    last_gid = games["game_id"][-1]
+
+    # First game: opp rolling and h2h are both null/0 (no prior history).
+    first = pf.filter(pl.col("game_id") == first_gid)
+    assert first["opp_def_rtg_10"].is_null().all()
+    assert (first["h2h_last_meeting_margin"] == 0.0).all()
+    # opp_team_id is still populated — it's identity, not history.
+    assert first["opp_team_id"].is_not_null().all()
+
+    # Last game: opp_def_rtg_10 must be populated (opp has prior games now).
+    last = pf.filter(pl.col("game_id") == last_gid)
+    assert last["opp_def_rtg_10"].is_not_null().all()
+
+
+def test_interim_to_processed_carries_matchup_columns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If build_feature_tables put matchup columns into player_features,
+    interim_to_processed must preserve them through the join + concat +
+    write to ``data/processed/<split>.parquet``."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    spec = SplitSpec(train=[2022], val=[], test=[])
+    paths = interim_to_processed(spec)
+    train = pl.read_parquet(paths["train"])
+    missing = _MATCHUP_COLS - set(train.columns)
+    assert not missing, f"processed train missing matchup cols: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# Context feature wiring — mirrors the matchup-wiring tests. Hand-computed
+# values are in test_features.py; here we check only flow-through.
+# ---------------------------------------------------------------------------
+
+_CONTEXT_COLS = {
+    "is_home", "rest_days", "b2b", "is_3in4", "is_4in6",
+    "season_phase", "day_of_week", "month",
+    "altitude_ft", "travel_miles_prev",
+}
+
+
+def test_build_feature_tables_writes_context_columns_into_player_features(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """player_features.parquet must carry the 10 context columns after
+    build_feature_tables runs. Guards the wiring: if the context call
+    gets dropped, this fails."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    build_feature_tables(2022)
+    pf = pl.read_parquet(interim / "2022" / etl.PLAYER_FEATURES_FILENAME)
+    missing = _CONTEXT_COLS - set(pf.columns)
+    assert not missing, f"player_features missing context cols: {sorted(missing)}"
+
+
+def test_build_feature_tables_context_values_populated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Sanity that the join actually attached values, not just column
+    headers. Pure per-row features (altitude, day_of_week, month,
+    is_home, season_phase) must be populated on every row including
+    the first game; shift-based features (rest_days, b2b, travel) are
+    null only for the very first game of the season."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022, n_games=3)
+
+    build_feature_tables(2022)
+    pf = pl.read_parquet(interim / "2022" / etl.PLAYER_FEATURES_FILENAME)
+
+    # Pure per-row features: no nulls anywhere.
+    for col in ("altitude_ft", "day_of_week", "month", "is_home", "season_phase"):
+        assert pf[col].is_not_null().all(), f"{col} has nulls — context join missed rows"
+
+    # Shift-based features: not all null. We don't pin specific values
+    # here (test_features.py does that); just confirm the join populated
+    # at least the later games.
+    assert pf["rest_days"].is_not_null().any()
+    assert pf["travel_miles_prev"].is_not_null().any()
+
+
+def test_interim_to_processed_carries_context_columns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """interim_to_processed must preserve context columns through the
+    join + concat + write to data/processed/<split>.parquet."""
+    interim, _ = _redirect_all_dirs(monkeypatch, tmp_path)
+    _seed_season_interim(interim / "2022", 2022)
+
+    spec = SplitSpec(train=[2022], val=[], test=[])
+    paths = interim_to_processed(spec)
+    train = pl.read_parquet(paths["train"])
+    missing = _CONTEXT_COLS - set(train.columns)
+    assert not missing, f"processed train missing context cols: {sorted(missing)}"
