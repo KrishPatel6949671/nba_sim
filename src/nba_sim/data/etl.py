@@ -573,7 +573,20 @@ def build_feature_tables(season: int, *, refresh: bool = False) -> Path:
         context_features, on=["game_id", "team_id"], how="left"
     )
 
+    # Season-to-date averages are the strictly-prior cumulative-mean
+    # features that the season-average baseline depends on (PLAN §6.3).
+    # Without joining these onto player_features, any model trained on the
+    # processed parquet is competing with SAB on lossier signals (rolling
+    # 5/10/20 windows rather than the full season-to-date mean), which
+    # makes the Phase 1 ship gate effectively unwinnable. Keep std_games
+    # plus every std_{stat}_avg column; drop the per-row identity cols
+    # already on player_features (date, season).
     std = season_to_date(player_box, games)
+    std_join = std.select(
+        ["game_id", "player_id"]
+        + [c for c in std.columns if c == "std_games" or (c.startswith("std_") and c.endswith("_avg"))]
+    )
+    player_features = player_features.join(std_join, on=["game_id", "player_id"], how="left")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_parquet_atomic(player_features, out_dir / PLAYER_FEATURES_FILENAME)
