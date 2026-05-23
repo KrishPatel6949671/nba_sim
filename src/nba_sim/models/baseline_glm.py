@@ -634,15 +634,16 @@ class PoissonGLMBaseline:
 def _per_stat_mae(
     actual: pl.DataFrame, predicted: pl.DataFrame, stats: tuple[str, ...]
 ) -> dict[str, float]:
-    """Mean absolute error per stat, computed on the inner-join of (actual,
-    predicted) by (game_id, player_id, team_id)."""
-    joined = actual.join(
-        predicted, on=["game_id", "player_id", "team_id"], how="inner"
-    )
-    return {
-        s: float((joined[s].cast(pl.Float64) - joined[f"pred_{s}"]).abs().mean())
-        for s in stats
-    }
+    """Thin wrapper around :func:`nba_sim.training.metrics.per_stat_mae`.
+
+    Kept as a module-local name so the CLI script's call sites don't
+    change. The actual implementation lives in ``training.metrics`` so
+    that the GLM baseline and the Phase 2 NN are scored with literally
+    the same code — eliminates one source of MAE-comparison drift.
+    """
+    from nba_sim.training.metrics import per_stat_mae
+
+    return per_stat_mae(actual, predicted, stats=stats)
 
 
 def _format_mae_table(

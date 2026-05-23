@@ -8,8 +8,9 @@ dims:
   d_player_raw: 48            # pre-encoder feature vector per player
   d_player: 64                # player feature embedding dim (after encoder)
   d_team: 128                 # pooled team representation dim
-  d_context: 32               # game-context encoding dim
-  d_matchup: 16               # matchup-feature encoding dim
+  d_context_raw: 24           # raw context feature vector (pre-encoder)
+  d_context: 32               # game-context encoding dim (post-encoder)
+  d_matchup: 16               # matchup-feature dim (raw — no separate encoder)
 
 roster:
   max_active_players: 15      # padding target; games rarely use more
