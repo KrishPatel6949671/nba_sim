@@ -23,17 +23,21 @@ optim:
 
 schedule:
   name: cosine_with_warmup
-  warmup_steps: 500
+  warmup_steps: 100
   max_epochs: 30
 
 loop:
   batch_size: 64
-  num_workers: 4
-  pin_memory: true
+  # num_workers: 0 — single-process loading. Multi-worker fork()s a
+  # polars-using process, which deadlocks (polars docs warn about this on
+  # Python <3.14). Set higher only if you've validated no hang on your env.
+  num_workers: 0
+  # pin_memory only helps with CUDA host→device transfers; off for CPU runs.
+  pin_memory: false
   eval_every_epoch: true
 
 curriculum:
-  team_level_pretrain_epochs: 5
+  team_level_pretrain_epochs: 2
   joint_epochs: 25
 
 early_stopping:
@@ -64,8 +68,11 @@ loss_weights:
   embedding_pool: 1.0e-3    # partial-pooling L2 on player embedding deltas
 
 tracking:
-  backend: wandb            # wandb | tensorboard | none
+  # Default 'none' (stdout-only). Set to 'wandb' AFTER `wandb login` has
+  # populated ~/.netrc — otherwise wandb-core panics on credential fetch.
+  # PLAN §5.5 calls for wandb offline-by-default; opt in by editing this.
+  backend: none             # wandb | tensorboard | none
   project: nba-sim
   entity: null
   log_every_n_steps: 25
-  also_write_tensorboard: true
+  also_write_tensorboard: false

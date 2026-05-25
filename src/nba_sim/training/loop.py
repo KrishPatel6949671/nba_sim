@@ -161,12 +161,18 @@ class _Tracker:
         self._wandb = None
         self._tb = None
         if backend == "wandb":
+            # Default to offline mode so a missing ~/.netrc doesn't crash
+            # the wandb-core subprocess. Users explicitly setting WANDB_MODE
+            # (e.g. "online" after `wandb login`) override this.
+            os.environ.setdefault("WANDB_MODE", "offline")
+            os.environ.setdefault("WANDB_SILENT", "true")
             try:
                 import wandb
                 wandb.init(
                     project=tracking_cfg.get("project"),
                     entity=tracking_cfg.get("entity"),
                     config=tracking_cfg,
+                    mode=os.environ.get("WANDB_MODE", "offline"),
                 )
                 self._wandb = wandb
             except Exception:
