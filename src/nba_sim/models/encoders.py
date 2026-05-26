@@ -44,19 +44,24 @@ def _build_mlp(
 
 
 class PlayerEncoder(nn.Module):
-    """Per-player feature encoder with a learned player-embedding table.
+    """Per-player feature encoder with PLAN §5.4 partial-pooling embedding.
 
-    Concatenates ``[raw_features, player_embedding, role_embedding]`` and
-    pushes the result through an MLP to produce a ``d_out``-dim vector
-    per player. Output for padded slots is zeroed using the mask so
-    downstream pooling can ignore them safely.
+    Each player's embedding is decomposed as ``e_i = role_centroid[role(i)]
+    + δ_i`` with ``δ_i`` initialized to 0. Players with the same role share
+    an identical embedding at init; only training pushes their ``δ_i``
+    away from zero. An L2 penalty on ``δ_i`` (applied externally by
+    :func:`nba_sim.models.losses.composite_nll`) keeps rare / seldom-seen
+    players close to their role's prior centroid.
+
+    Concatenates ``[raw_features, e_i]`` and pushes the result through an
+    MLP to produce a ``d_out``-dim vector per player. Output for padded
+    slots is zeroed using the mask so downstream pooling can ignore them.
     """
 
     def __init__(
         self,
         d_player_raw: int,
         d_player_embed: int,
-        d_role_embed: int,
         d_out: int,
         n_players: int,
         n_roles: int,
@@ -66,13 +71,19 @@ class PlayerEncoder(nn.Module):
         super().__init__()
         self.d_player_raw = d_player_raw
         self.d_out = d_out
+        self.d_player_embed = d_player_embed
 
-        # padding_idx=0 zeros the gradient for the padding row and starts
-        # its weights at zero. Real player IDs must be in [1, n_players-1].
-        self.player_embed = nn.Embedding(n_players, d_player_embed, padding_idx=0)
-        self.role_embed = nn.Embedding(n_roles, d_role_embed, padding_idx=0)
+        # Role centroid: shared across all players of the same role; this
+        # is the partial-pooling prior. padding_idx=0 keeps the padding
+        # row at zero so padded slots contribute zero downstream.
+        self.role_embed = nn.Embedding(n_roles, d_player_embed, padding_idx=0)
+        # Per-player δ: initialized to zero so every player starts at its
+        # role centroid. ``padding_idx=0`` additionally zeros the gradient
+        # for the padding row. Real player IDs are in [1, n_players-1].
+        self.player_delta = nn.Embedding(n_players, d_player_embed, padding_idx=0)
+        nn.init.zeros_(self.player_delta.weight)
 
-        d_concat = d_player_raw + d_player_embed + d_role_embed
+        d_concat = d_player_raw + d_player_embed
         self.mlp = _build_mlp(d_concat, hidden, d_out, dropout)
 
     def forward(
@@ -87,14 +98,29 @@ class PlayerEncoder(nn.Module):
                 f"PlayerEncoder expected D_p_raw={self.d_player_raw}, got {feats.shape[-1]}"
             )
 
-        p_emb = self.player_embed(player_ids)    # [B, P, d_player_embed]
-        r_emb = self.role_embed(role_ids)        # [B, P, d_role_embed]
-        x = torch.cat([feats, p_emb, r_emb], dim=-1)
-        out = self.mlp(x)                        # [B, P, d_out]
+        role_centroid = self.role_embed(role_ids)    # [B, P, d_player_embed]
+        delta = self.player_delta(player_ids)        # [B, P, d_player_embed]
+        e = role_centroid + delta                    # [B, P, d_player_embed]
+        x = torch.cat([feats, e], dim=-1)
+        out = self.mlp(x)                            # [B, P, d_out]
 
         # Zero padded slots so downstream code (pooling, heads) can rely
         # on the invariant that masked entries contribute nothing.
         return out * mask.unsqueeze(-1).to(out.dtype)
+
+    def gather_active_deltas(
+        self,
+        player_ids: torch.Tensor,    # [B, P] long
+        mask: torch.Tensor,          # [B, P] bool
+    ) -> torch.Tensor:               # [N_active, d_player_embed]
+        """Look up ``δ_i`` for masked-in player slots and flatten.
+
+        Used by :meth:`HierarchicalBoxScoreModel.embedding_deltas_for_batch`
+        to feed ``composite_nll(..., embedding_deltas=...)`` so the L2
+        partial-pooling penalty fires only on active players.
+        """
+        delta = self.player_delta(player_ids)        # [B, P, D]
+        return delta[mask]                           # [N_active, D]
 
 
 class RosterAttentionPool(nn.Module):

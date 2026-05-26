@@ -64,10 +64,12 @@ class HierarchicalBoxScoreModel(nn.Module):
         d_ctx = dims["d_context"]
         d_matchup = dims["d_matchup"]
 
+        # Partial-pooling embedding (PLAN §5.4): role centroid + per-player δ
+        # share a single dim (``d_player_embed``). The legacy ``d_role`` field
+        # in older model.yaml files is no longer consulted.
         self.player_encoder = PlayerEncoder(
             d_player_raw=dims["d_player_raw"],
             d_player_embed=emb["d_player_embed"],
-            d_role_embed=emb["d_role"],
             d_out=d_team,
             n_players=emb["n_players"],
             n_roles=emb["n_roles"],
@@ -183,6 +185,24 @@ class HierarchicalBoxScoreModel(nn.Module):
             pf_home=home_alloc["pf"],
             pf_away=away_alloc["pf"],
         )
+
+    def embedding_deltas_for_batch(
+        self, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Return ``[N_active_home + N_active_away, d_player_embed]`` deltas
+        for the L2 partial-pooling penalty (PLAN §5.4).
+
+        Call after ``forward(batch)`` and pass into
+        ``composite_nll(..., embedding_deltas=...)``. Cheap — one embedding
+        lookup per side plus a boolean gather.
+        """
+        home = self.player_encoder.gather_active_deltas(
+            batch["home_player_ids"], batch["home_mask"]
+        )
+        away = self.player_encoder.gather_active_deltas(
+            batch["away_player_ids"], batch["away_mask"]
+        )
+        return torch.cat([home, away], dim=0)
 
     def freeze_player_heads(self) -> None:
         """For §5.3 curriculum: train only pace + off_rtg in epochs 0–4."""

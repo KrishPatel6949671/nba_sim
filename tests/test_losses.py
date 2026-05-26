@@ -213,7 +213,7 @@ def test_gradients_flow_through_composite_loss() -> None:
 
     for name, p in model.named_parameters():
         if name in {
-            "player_encoder.player_embed.weight",
+            "player_encoder.player_delta.weight",
             "player_encoder.role_embed.weight",
         }:
             assert p.grad is not None, f"{name} grad is None"

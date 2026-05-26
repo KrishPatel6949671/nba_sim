@@ -36,8 +36,7 @@ from nba_sim.models.heads import (
 B = 4
 P = 15
 D_P_RAW = 48
-D_PLAYER_EMBED = 32
-D_ROLE_EMBED = 8
+D_PLAYER_EMBED = 32     # shared dim for role centroid AND player δ
 D_OUT = 64
 D_TEAM = 128
 D_CTX_RAW = 24
@@ -73,7 +72,6 @@ def _player_encoder() -> PlayerEncoder:
     return PlayerEncoder(
         d_player_raw=D_P_RAW,
         d_player_embed=D_PLAYER_EMBED,
-        d_role_embed=D_ROLE_EMBED,
         d_out=D_TEAM,
         n_players=N_PLAYERS,
         n_roles=N_ROLES,
@@ -107,13 +105,17 @@ def test_player_encoder_rejects_wrong_feature_dim() -> None:
 
 
 def test_player_embedding_padding_idx_starts_at_zero() -> None:
-    """padding_idx=0 means the row stays at zero so padded slots contribute 0."""
+    """padding_idx=0 means the row stays at zero so padded slots contribute 0.
+
+    Under PLAN §5.4 partial pooling, the entire ``player_delta`` table also
+    starts at zero (init to 0 so every player begins at its role centroid).
+    """
     enc = _player_encoder()
     assert torch.equal(
-        enc.player_embed.weight[0], torch.zeros_like(enc.player_embed.weight[0])
+        enc.role_embed.weight[0], torch.zeros_like(enc.role_embed.weight[0])
     )
     assert torch.equal(
-        enc.role_embed.weight[0], torch.zeros_like(enc.role_embed.weight[0])
+        enc.player_delta.weight, torch.zeros_like(enc.player_delta.weight)
     )
 
 
@@ -177,12 +179,11 @@ def test_encoder_gradients_flow_through_all_params() -> None:
     loss = pooled.sum() + ctx_out.sum()
     loss.backward()
 
-    # Player embedding row 0 is the padding row and is intentionally frozen
-    # at zero by ``padding_idx=0`` — same for role row 0. Skip those.
+    # Player delta row 0 and role row 0 are the padding rows, intentionally
+    # frozen at zero by ``padding_idx=0`` — check grads only on rows 1+.
     for module in (enc, pool, ctx_enc):
         for name, p in module.named_parameters():
-            if name in {"player_embed.weight", "role_embed.weight"}:
-                # Sum grads over the non-padding rows only.
+            if name in {"player_delta.weight", "role_embed.weight"}:
                 assert p.grad is not None, f"{name} grad is None"
                 assert torch.any(p.grad[1:] != 0), f"{name} non-padding grad is all zero"
             else:
@@ -403,7 +404,6 @@ def _model_config() -> dict:
             "n_teams": 40,
             "d_team_embed": 16,
             "n_roles": N_ROLES,
-            "d_role": D_ROLE_EMBED,
         },
         "encoder": {
             "player_mlp_hidden": [128, 128],
@@ -530,7 +530,7 @@ def test_hierarchical_gradients_flow_to_every_parameter() -> None:
 
     for name, p in model.named_parameters():
         if name in {
-            "player_encoder.player_embed.weight",
+            "player_encoder.player_delta.weight",
             "player_encoder.role_embed.weight",
         }:
             # padding_idx=0 row stays frozen at zero by design; rest must have grad.

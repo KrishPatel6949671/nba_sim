@@ -343,7 +343,10 @@ def train(
                 opt.zero_grad(set_to_none=True)
                 with _autocast_ctx(device, precision):
                     preds = model(batch)
-                    out = composite_nll(preds, batch, epoch_weights)
+                    deltas = model.embedding_deltas_for_batch(batch)
+                    out = composite_nll(
+                        preds, batch, epoch_weights, embedding_deltas=deltas
+                    )
                     loss = out["loss"]
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -375,7 +378,10 @@ def train(
                     batch = _move_batch(batch, device)
                     with _autocast_ctx(device, precision):
                         preds = model(batch)
-                        out = composite_nll(preds, batch, epoch_weights)
+                        deltas = model.embedding_deltas_for_batch(batch)
+                        out = composite_nll(
+                            preds, batch, epoch_weights, embedding_deltas=deltas
+                        )
                     B = batch["pace"].shape[0]
                     val_loss_sum += float(out["loss"].item()) * B
                     val_n += B
@@ -483,7 +489,10 @@ def evaluate(
         for batch in loader:
             batch = _move_batch(batch, dev)
             preds = model(batch)
-            out = composite_nll(preds, batch, weights)
+            deltas = model.embedding_deltas_for_batch(batch)
+            out = composite_nll(
+                preds, batch, weights, embedding_deltas=deltas
+            )
             B = batch["pace"].shape[0]
             loss_sum += float(out["loss"].item()) * B
             n += B

@@ -37,7 +37,7 @@ loop:
   eval_every_epoch: true
 
 curriculum:
-  team_level_pretrain_epochs: 2
+  team_level_pretrain_epochs: 0
   joint_epochs: 25
 
 early_stopping:
