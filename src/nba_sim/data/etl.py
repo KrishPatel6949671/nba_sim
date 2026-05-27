@@ -146,13 +146,22 @@ def _write_json_atomic(payload: dict[str, Any], path: Path) -> None:
 
 
 def _models_to_df(models: list[Any]) -> pl.DataFrame:
-    """Pydantic models -> polars DataFrame, preserving field order."""
+    """Pydantic models -> polars DataFrame, preserving field order.
+
+    Scans every row for schema inference (``infer_schema_length=None``).
+    Default is 100 rows, which breaks when an optional field (e.g.
+    ``dropped_reason``) is None for the first 100 games of a season and
+    then gets a string value on a later game -- polars infers ``Null``
+    type from the first 100 and can't append the string.
+    """
     if not models:
         # An empty DataFrame still needs a schema for downstream readers.
         # Returning an empty no-column frame is fine for v1; the consumers
         # will know how to handle "season had 0 valid X".
         return pl.DataFrame()
-    return pl.DataFrame([m.model_dump() for m in models])
+    return pl.DataFrame(
+        [m.model_dump() for m in models], infer_schema_length=None
+    )
 
 
 # ---------------------------------------------------------------------------
