@@ -151,12 +151,40 @@ def build_features(
 
 @app.command()
 def train(
-    config: str = typer.Option("configs/train.yaml"),
-    model: str = typer.Option("hierarchical", help="{baseline|hierarchical}"),
-    max_epochs: int | None = typer.Option(None, help="Override config max_epochs"),
+    config: Path = typer.Option(
+        Path("configs/train.yaml"),
+        help="Path to train.yaml.",
+    ),
+    max_epochs: int | None = typer.Option(
+        None, help="Override schedule.max_epochs."
+    ),
+    seed: int | None = typer.Option(None, help="Override run.seed."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Train the baseline or the hierarchical NN."""
-    raise NotImplementedError
+    """Train the hierarchical NN end-to-end.
+
+    Resolves ``model_config`` / ``data_config`` from ``train.yaml`` relative
+    to the repo root, runs the training loop, and writes checkpoints +
+    ``training_summary.json`` under ``paths.checkpoint_dir``.
+    """
+    _setup_logging(verbose)
+    from nba_sim.training.loop import train_from_yaml
+
+    if not config.exists():
+        raise typer.BadParameter(f"config file not found: {config}")
+
+    overrides: dict = {}
+    if max_epochs is not None:
+        overrides["schedule"] = {"max_epochs": max_epochs}
+    if seed is not None:
+        overrides["run"] = {"seed": seed}
+
+    summary = train_from_yaml(config, overrides=overrides or None)
+    typer.echo(
+        f"best_val_nll={summary['best_val_nll']:.6f} "
+        f"@ epoch {summary['best_epoch']} "
+        f"({summary['epochs_trained']} trained)"
+    )
 
 
 @app.command()

@@ -24,7 +24,7 @@ optim:
 schedule:
   name: cosine_with_warmup
   warmup_steps: 100
-  max_epochs: 30
+  max_epochs: 60
 
 loop:
   batch_size: 64
@@ -44,7 +44,7 @@ early_stopping:
   enabled: true
   metric: val_composite_nll
   mode: min
-  patience: 5
+  patience: 10
 
 loss_weights:
   # Starting weights; tuned once on validation, then fixed.
