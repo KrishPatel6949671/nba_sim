@@ -190,10 +190,80 @@ def train(
 @app.command()
 def evaluate(
     split: str = typer.Option("val", help="{val|test}"),
-    checkpoint: str = typer.Option("models/best.pt"),
+    checkpoint: Path = typer.Option(
+        Path("models/best.pt"), help="Path to .pt checkpoint."
+    ),
+    config: Path = typer.Option(
+        Path("configs/train.yaml"),
+        help="train.yaml; its data_config resolves the processed parquets.",
+    ),
+    report_dir: Path = typer.Option(
+        Path("reports"), help="Where to write metrics.json + plots."
+    ),
+    n_interval_samples: int = typer.Option(
+        200, help="Samples per game for empirical 10th/90th-percentile intervals."
+    ),
+    batch_size: int = typer.Option(64),
+    device: str = typer.Option("auto", help="{auto|cpu|cuda}"),
+    seed: int = typer.Option(0),
+    no_plots: bool = typer.Option(False, help="Skip reliability + scatter PNGs."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Evaluate a checkpoint on the named split."""
-    raise NotImplementedError
+    """Evaluate a checkpoint on the named split.
+
+    Resolves ``<split>.parquet`` and ``train.parquet`` from
+    ``train.yaml → data_config → paths.processed`` (same path discipline
+    as ``nba-sim train``). Runs the full eval pipeline (per-stat MAE,
+    interval coverage, constraint violations, team-PTS MAE under both
+    the player-sum and team-head paths) and writes
+    ``<report_dir>/metrics.json`` plus diagnostic PNGs.
+    """
+    _setup_logging(verbose)
+
+    if split not in ("val", "test"):
+        raise typer.BadParameter(f"split must be 'val' or 'test', got {split!r}")
+    if not checkpoint.exists():
+        raise typer.BadParameter(f"checkpoint not found: {checkpoint}")
+    if not config.exists():
+        raise typer.BadParameter(f"config file not found: {config}")
+
+    from nba_sim.training.evaluate import evaluate as run_eval
+    from nba_sim.training.loop import _load_yaml, _resolve_path
+
+    train_cfg = _load_yaml(config)
+    repo_root = config.resolve().parent.parent
+    data_cfg = _load_yaml(_resolve_path(train_cfg["data_config"], repo_root))
+    processed_dir = _resolve_path(data_cfg["paths"]["processed"], repo_root)
+
+    train_parquet = processed_dir / "train.parquet"
+    eval_parquet = processed_dir / f"{split}.parquet"
+    for label, p in (("train", train_parquet), (split, eval_parquet)):
+        if not p.exists():
+            raise typer.BadParameter(f"{label} parquet not found: {p}")
+
+    summary = run_eval(
+        checkpoint=checkpoint,
+        parquet=eval_parquet,
+        train_parquet=train_parquet,
+        report_dir=report_dir,
+        n_interval_samples=n_interval_samples,
+        batch_size=batch_size,
+        device=device,
+        seed=seed,
+        include_plots=not no_plots,
+    )
+
+    typer.echo(f"per-stat MAE: {summary['per_stat_mae']}")
+    typer.echo(
+        f"team PTS MAE (player-sum): {summary['team_pts_mae']:.3f}"
+    )
+    typer.echo(
+        f"team PTS MAE (team-head):  {summary['team_pts_mae_team_head']:.3f}"
+    )
+    typer.echo(f"pace MAE:     {summary['pace_mae']:.3f}")
+    typer.echo(f"off_rtg MAE:  {summary['off_rtg_mae']:.3f}")
+    typer.echo(f"80% PI coverage: {summary['interval_coverage']}")
+    typer.echo(f"constraint violations: {summary['constraint_violation_rate']}")
 
 
 @app.command()

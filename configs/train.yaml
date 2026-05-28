@@ -66,6 +66,13 @@ loss_weights:
   pf: 1.0
   gate: 0.5
   embedding_pool: 1.0e-3    # partial-pooling L2 on player embedding deltas
+  # Couples Σ E[player_pts] to pace*off_rtg/100 via Smooth-L1 (Huber).
+  # The team head is the better team-PTS predictor (~9.5 MAE vs ~13 for
+  # the player sum); this nudges the player allocations toward it without
+  # dominating the per-stat NLLs. First attempt at λ=0.1 with MSE broke
+  # the FGA/FGM heads (per-stat MAE doubled); 0.01 with Huber is the
+  # corrected starting point. 0 = inert.
+  coupling: 0.01
 
 tracking:
   # Default 'none' (stdout-only). Set to 'wandb' AFTER `wandb login` has

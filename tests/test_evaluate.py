@@ -245,7 +245,8 @@ def test_evaluate_writes_metrics_json_and_pngs(trained_setup: dict[str, Path]) -
     )
     # Top-level metric keys per PLAN §6.2.
     for k in ("per_stat_mae", "per_stat_rmse", "interval_coverage",
-              "team_pts_mae", "pace_mae", "off_rtg_mae",
+              "team_pts_mae", "team_pts_mae_team_head",
+              "pace_mae", "off_rtg_mae",
               "constraint_violation_rate", "reliability_bins"):
         assert k in summary, k
 

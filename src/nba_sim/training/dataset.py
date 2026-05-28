@@ -47,7 +47,7 @@ from torch.utils.data import Dataset
 # corresponding output tensor.
 # ---------------------------------------------------------------------------
 
-# 40 numeric player features (z-score standardized).
+# 45 numeric player features (z-score standardized).
 _PLAYER_NUMERIC_COLS: tuple[str, ...] = (
     # Rolling form (12).
     "p_min_avg_5", "p_min_avg_10", "p_min_avg_20",
@@ -67,6 +67,10 @@ _PLAYER_NUMERIC_COLS: tuple[str, ...] = (
     "std_stl_avg", "std_blk_avg", "std_tov_avg", "std_pf_avg",
     # Schedule-flavor numerics (2).
     "rest_days", "travel_miles_prev",
+    # Career shooting-skill priors + FT-rate (5). Address the chronic
+    # ftm/fta/blk gap where rolling-N averages don't stabilize the signal.
+    "p_fg_pct_career", "p_tp_pct_career", "p_ft_pct_career",
+    "p_blk_per36_career", "p_ft_rate_10",
 )
 
 # 4 position one-hot buckets. ``""`` catches missing / unrecognized.
@@ -75,11 +79,11 @@ _POSITION_TOKENS: tuple[str, ...] = ("G", "F", "C", "")
 # 4 passthrough booleans (cast to 0/1 float).
 _PLAYER_BOOL_COLS: tuple[str, ...] = ("is_starter", "dnp", "is_home", "b2b")
 
-# Sanity: 40 + 4 + 4 = 48 = d_player_raw in configs/model.yaml.
+# Sanity: 45 + 4 + 4 = 53 = d_player_raw in configs/model.yaml.
 _D_PLAYER_RAW: int = (
     len(_PLAYER_NUMERIC_COLS) + len(_POSITION_TOKENS) + len(_PLAYER_BOOL_COLS)
 )
-assert _D_PLAYER_RAW == 48, _D_PLAYER_RAW
+assert _D_PLAYER_RAW == 53, _D_PLAYER_RAW
 
 # Context numerics (5) standardized; rest of d_context_raw=24 is one-hots +
 # cyclic encodings + bools assembled inline in ``_build_context``.

@@ -5,9 +5,9 @@
 architecture: hierarchical    # {baseline | hierarchical}
 
 dims:
-  d_player_raw: 48            # pre-encoder feature vector per player
+  d_player_raw: 53            # pre-encoder feature vector per player (45 numeric + 4 pos + 4 bool)
   d_player: 64                # player feature embedding dim (after encoder)
-  d_team: 128                 # pooled team representation dim
+  d_team: 192                 # pooled team representation dim (tune5 Run 01)
   d_context_raw: 24           # raw context feature vector (pre-encoder)
   d_context: 32               # game-context encoding dim (post-encoder)
   d_matchup: 16               # matchup-feature dim (raw — no separate encoder)
@@ -25,7 +25,7 @@ embeddings:
   n_roles: 4                  # starter / rotation / end-of-bench / inactive
 
 encoder:
-  player_mlp_hidden: [128, 128]
+  player_mlp_hidden: [192, 192]    # tune5 Run 01 — best team-head MAE
   player_mlp_dropout: 0.1
   roster_attention_heads: 4
   roster_attention_dropout: 0.1

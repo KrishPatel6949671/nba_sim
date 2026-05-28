@@ -160,12 +160,18 @@ def test_player_rolling_shape_without_team_box() -> None:
     expected_pts_pm = {f"p_pts_per_min_{w}" for w in PLAYER_WINDOWS}
     per_min_stats = ("fga", "tpa", "fta", "reb", "ast", "stl", "blk", "tov", "pf")
     expected_per_min = {f"p_{s}_per_min_10" for s in per_min_stats}
+    expected_career = {
+        "p_fg_pct_career", "p_tp_pct_career", "p_ft_pct_career",
+        "p_blk_per36_career",
+    }
 
     cols = set(out.columns)
     assert expected_min_avg <= cols
     assert expected_ts <= cols
     assert expected_pts_pm <= cols
     assert expected_per_min <= cols
+    assert expected_career <= cols
+    assert "p_ft_rate_10" in cols
     assert "p_games_played_season" in cols
     # USG% columns should NOT be present without team_box.
     assert not any(c.startswith("p_usage_avg_") for c in cols)
@@ -193,6 +199,8 @@ def test_player_rolling_first_game_is_null() -> None:
         c for c in out.columns
         if c.startswith(("p_min_avg_", "p_ts_", "p_pts_per_min_", "p_games_played_season"))
         or (c.startswith("p_") and c.endswith("_per_min_10"))
+        or c.endswith("_career")
+        or c == "p_ft_rate_10"
     ]
     rolling_cols.remove("p_games_played_season")  # this is 0, not null
     for c in rolling_cols:
@@ -228,6 +236,36 @@ def test_player_rolling_third_game_pooled_correctly() -> None:
     denom = 2 * ((15 + 0.44 * 4) + (12 + 0.44 * 2))
     assert g3["p_ts_5"] == pytest.approx(36.0 / denom)
     assert g3["p_games_played_season"] == 2
+
+
+def test_player_rolling_career_priors_and_ft_rate() -> None:
+    """Career-pooled shooting priors and FT-rate-10 use the same
+    cum_sum() - current trick as season_to_date but without season reset.
+
+    G1: fgm=8/fga=15, tpm=2/tpa=5, ftm=2/fta=4, blk=1, min=30.
+    G2: fgm=7/fga=12, tpm=2/tpa=4, ftm=0/fta=2, blk=0, min=24.
+
+    At G2 (1 prior game): all priors reflect G1 alone.
+    At G3 (2 prior games): all priors reflect G1+G2 pooled.
+    """
+    games, pb = _three_game_player_setup()
+    out = player_rolling(pb, games).sort("date")
+    g2 = out.filter(pl.col("game_id") == "G2").row(0, named=True)
+    g3 = out.filter(pl.col("game_id") == "G3").row(0, named=True)
+
+    # G2: priors == G1 stats.
+    assert g2["p_fg_pct_career"] == pytest.approx(8 / 15)
+    assert g2["p_tp_pct_career"] == pytest.approx(2 / 5)
+    assert g2["p_ft_pct_career"] == pytest.approx(2 / 4)
+    assert g2["p_blk_per36_career"] == pytest.approx(36 * 1 / 30)
+    assert g2["p_ft_rate_10"] == pytest.approx(4 / 15)
+
+    # G3: priors == G1+G2 pooled (sum / sum, not mean of ratios).
+    assert g3["p_fg_pct_career"] == pytest.approx((8 + 7) / (15 + 12))
+    assert g3["p_tp_pct_career"] == pytest.approx((2 + 2) / (5 + 4))
+    assert g3["p_ft_pct_career"] == pytest.approx((2 + 0) / (4 + 2))
+    assert g3["p_blk_per36_career"] == pytest.approx(36 * (1 + 0) / (30 + 24))
+    assert g3["p_ft_rate_10"] == pytest.approx((4 + 2) / (15 + 12))
 
 
 def test_player_rolling_pooled_not_mean_of_ratios() -> None:

@@ -51,6 +51,7 @@ from nba_sim.training.metrics import (
     per_stat_rmse,
     reliability_bins,
     team_pts_mae,
+    team_pts_mae_team_head,
 )
 
 
@@ -589,7 +590,15 @@ def evaluate(
     metrics["interval_coverage"] = interval_coverage(
         actuals, low_df, high_df, target=0.80, stats=stats_to_score
     )
+    # team_pts_mae kept under the legacy name (player-sum path) for
+    # backwards-compat with prior reports. team_pts_mae_team_head is the
+    # direct estimate from pace * off_rtg / 100 — see metrics.py for why
+    # it's strictly better as a team-level predictor.
     metrics["team_pts_mae"] = team_pts_mae(actuals, means_df)
+    if not team_df.is_empty():
+        metrics["team_pts_mae_team_head"] = team_pts_mae_team_head(actuals, team_df)
+    else:
+        metrics["team_pts_mae_team_head"] = float("nan")
 
     # Pace + off_rtg MAE (team-level scalars).
     if not team_df.is_empty():
@@ -672,7 +681,8 @@ def _main(argv: list[str] | None = None) -> int:
     )
     # Print the top-line metrics for quick inspection.
     print(f"per-stat MAE: {summary['per_stat_mae']}")
-    print(f"team PTS MAE: {summary['team_pts_mae']:.3f}")
+    print(f"team PTS MAE (player-sum): {summary['team_pts_mae']:.3f}")
+    print(f"team PTS MAE (team-head):  {summary['team_pts_mae_team_head']:.3f}")
     print(f"pace MAE:     {summary['pace_mae']:.3f}")
     print(f"off_rtg MAE:  {summary['off_rtg_mae']:.3f}")
     print(f"80% PI coverage: {summary['interval_coverage']}")

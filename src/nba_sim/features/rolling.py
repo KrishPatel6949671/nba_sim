@@ -213,6 +213,46 @@ def player_rolling(
             )
         )
 
+    # Career-pooled shooting priors. Partitions on player_id only (no
+    # season) so the prior spans the player's whole career — useful for
+    # shooting-skill stats that rolling-N windows don't stabilize (a 75%
+    # career FT shooter stays near 75% almost regardless of last-10 noise).
+    # Same ``cum_sum() - current`` trick as season_to_date, just without the
+    # season reset.
+    for make, attempt, alias in (
+        ("fgm", "fga", "p_fg_pct_career"),
+        ("tpm", "tpa", "p_tp_pct_career"),
+        ("ftm", "fta", "p_ft_pct_career"),
+    ):
+        num = pl.col(make).cum_sum().over("player_id") - pl.col(make)
+        den = pl.col(attempt).cum_sum().over("player_id") - pl.col(attempt)
+        rolls.append(
+            pl.when(den > 0).then(num / den).otherwise(None).alias(alias)
+        )
+
+    # Career blocks per 36 minutes — same partition, normalized to per-36
+    # so the scale is human-readable and matches the per-min convention.
+    blk_prior = pl.col("blk").cum_sum().over("player_id") - pl.col("blk")
+    min_prior = pl.col("minutes").cum_sum().over("player_id") - pl.col("minutes")
+    rolls.append(
+        pl.when(min_prior > 0)
+        .then(36.0 * blk_prior / min_prior)
+        .otherwise(None)
+        .alias("p_blk_per36_career")
+    )
+
+    # Free-throw rate over last 10 games (pooled FTA / FGA). Decouples
+    # "gets to the line" from "shoots a lot" — bigs who draw fouls need a
+    # different FTA prediction than perimeter shooters with the same FGA
+    # volume. Belongs in rolling rather than career because foul-drawing
+    # is more game-flow / scheme dependent than pure shooting skill.
+    rolls.append(
+        _ratio_of_sums(
+            "fta", "fga", 10,
+            partition="player_id", alias="p_ft_rate_10",
+        )
+    )
+
     # Cumulative season game count, prior-only:
     #   cum_count includes the current row, so subtract 1 to get "games
     #   played before this one". Partitioning on (player_id, season) makes

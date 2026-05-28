@@ -1,0 +1,50 @@
+[
+  {
+    "run": "00_baseline",
+    "n_rows": 2460,
+    "mae_player_sum": 13.318792785276267,
+    "mae_team_head": 9.452616496339505,
+    "mae_blend50": 10.196972317306779,
+    "mae_oracle": 1.2822409556587764
+  },
+  {
+    "run": "01_bigger_player_rep",
+    "n_rows": 2460,
+    "mae_player_sum": 13.731381142708118,
+    "mae_team_head": 9.417103071588771,
+    "mae_blend50": 10.3825548128497,
+    "mae_oracle": 1.2822409556587764
+  },
+  {
+    "run": "02_bigger_player_embed",
+    "n_rows": 2460,
+    "mae_player_sum": 13.03756467748085,
+    "mae_team_head": 9.817458088231746,
+    "mae_blend50": 10.334527280702545,
+    "mae_oracle": 1.2822409556587764
+  },
+  {
+    "run": "03_minutes_gate_rebalance",
+    "n_rows": 2460,
+    "mae_player_sum": 13.330185135135974,
+    "mae_team_head": 9.475574460908181,
+    "mae_blend50": 10.20319298082234,
+    "mae_oracle": 1.2822409556587764
+  },
+  {
+    "run": "04_longer_patience",
+    "n_rows": 2460,
+    "mae_player_sum": 13.318792785276267,
+    "mae_team_head": 9.452616496339505,
+    "mae_blend50": 10.196972317306779,
+    "mae_oracle": 1.2822409556587764
+  },
+  {
+    "run": "05_lower_lr",
+    "n_rows": 2460,
+    "mae_player_sum": 14.22692783073672,
+    "mae_team_head": 9.687309449726902,
+    "mae_blend50": 10.829986686756792,
+    "mae_oracle": 1.2822409556587764
+  }
+]

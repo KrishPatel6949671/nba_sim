@@ -110,6 +110,7 @@ def test_composite_nll_produces_all_per_head_keys() -> None:
         "fga", "tpa", "fta", "fgm", "tpm", "ftm",
         "oreb", "dreb", "ast", "stl", "blk", "tov", "pf",
         "embedding_pool",
+        "coupling",
     }
     assert set(out.keys()) == expected
     for k in expected:

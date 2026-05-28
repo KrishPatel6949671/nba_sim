@@ -21,6 +21,7 @@ from nba_sim.training.dataset import (
     BoxScoreDataset,
     FeatureStats,
     _COUNT_STAT_COLS,
+    _D_PLAYER_RAW,
     _PLAYER_NUMERIC_COLS,
     collate_games,
 )
@@ -175,8 +176,8 @@ def test_item_has_all_required_keys(synthetic_parquet: Path) -> None:
 def test_item_tensor_shapes(synthetic_parquet: Path) -> None:
     ds = BoxScoreDataset(synthetic_parquet, max_players=15)
     item = ds[0]
-    assert item["home_player_feats"].shape == (15, 48)
-    assert item["away_player_feats"].shape == (15, 48)
+    assert item["home_player_feats"].shape == (15, _D_PLAYER_RAW)
+    assert item["away_player_feats"].shape == (15, _D_PLAYER_RAW)
     assert item["home_player_ids"].shape == (15,)
     assert item["home_role_ids"].shape == (15,)
     assert item["home_mask"].shape == (15,)
@@ -318,7 +319,7 @@ def test_truncates_to_max_players_keeping_top_minutes(tmp_path: Path) -> None:
 def test_collate_stacks_to_batched_shapes(synthetic_parquet: Path) -> None:
     ds = BoxScoreDataset(synthetic_parquet)
     batch = collate_games([ds[0], ds[1]])
-    assert batch["home_player_feats"].shape == (2, 15, 48)
+    assert batch["home_player_feats"].shape == (2, 15, _D_PLAYER_RAW)
     assert batch["context"].shape == (2, 24)
     assert batch["matchup"].shape == (2, 16)
     assert batch["pace"].shape == (2,)

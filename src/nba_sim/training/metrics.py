@@ -220,3 +220,30 @@ def team_pts_mae(
     )
     joined = team_actual.join(team_pred, on=list(on), how="inner")
     return float((joined["team_pts"] - joined["team_pred_pts"]).abs().mean())
+
+
+def team_pts_mae_team_head(
+    actual: pl.DataFrame,
+    team_predicted: pl.DataFrame,
+    on: tuple[str, ...] = ("game_id", "team_id"),
+) -> float:
+    """Team PTS MAE using the team head's direct estimate.
+
+    ``team_predicted`` is the per-(game,team) DataFrame returned by
+    :func:`nba_sim.training.evaluate.predict_team_aggregates` — it carries
+    ``pred_pace`` and ``pred_off_rtg`` per team-game. Predicted team PTS
+    is ``pred_pace * pred_off_rtg / 100``.
+
+    Empirically (see scripts/team_pts_diagnostic.py) this beats the
+    sum-of-players path by ~3-4 MAE units because summing 8-10 noisy
+    per-player count draws compounds variance — the team head emits a
+    single direct estimate of an inherently team-level quantity.
+    """
+    team_actual = actual.group_by(list(on)).agg(
+        pl.col("pts").cast(pl.Float64).sum().alias("team_pts")
+    )
+    team_pred = team_predicted.with_columns(
+        (pl.col("pred_pace") * pl.col("pred_off_rtg") / 100.0).alias("team_pred_pts")
+    ).select([*on, "team_pred_pts"])
+    joined = team_actual.join(team_pred, on=list(on), how="inner")
+    return float((joined["team_pts"] - joined["team_pred_pts"]).abs().mean())

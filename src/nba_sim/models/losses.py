@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch.distributions import Binomial
 
 from nba_sim.models.heads import BoxScoreDistribution
@@ -56,6 +57,11 @@ class LossWeights:
     pf: float
     gate: float
     embedding_pool: float
+    # MSE between Σ E[player_pts] and pace*off_rtg/100. Default 0 keeps the
+    # term inert when not specified in train.yaml. See composite_nll for
+    # the rationale and scripts/team_pts_diagnostic.py for the empirical
+    # motivation.
+    coupling: float = 0.0
 
     @classmethod
     def default(cls) -> "LossWeights":
@@ -66,6 +72,7 @@ class LossWeights:
             oreb=1.0, dreb=1.0, ast=1.0, stl=1.0, blk=1.0, tov=1.0, pf=1.0,
             gate=0.5,
             embedding_pool=1e-3,
+            coupling=0.0,
         )
 
 
@@ -84,6 +91,40 @@ def _masked_mean(log_prob: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean of ``-log_prob`` over True entries of ``mask``."""
     nll = -log_prob * mask
     return nll.sum() / mask.sum().clamp(min=1.0)
+
+
+def _team_pts_player_sum(
+    preds: BoxScoreDistribution, side: str, mask: torch.Tensor
+) -> torch.Tensor:
+    """Σ E[player_pts] for one side. Shape ``[B]``.
+
+    Expected pts per player::
+
+        E[pts] = P(plays) * (2 * E[FGA] * σ(fgm_logits)
+                             +     E[TPA] * σ(tpm_logits)
+                             +     E[FTA] * σ(ftm_logits))
+
+    Gate-weighted because the sampler outputs 0 for slots where plays_gate
+    samples to 0; matching this in the mean-prediction expression keeps
+    the coupling term measuring the same quantity as the player-sum MAE
+    we observe in evaluate.py.
+    """
+    fga_mean = getattr(preds, f"fga_{side}").mean              # [B, P]
+    tpa_mean = getattr(preds, f"tpa_{side}").mean
+    fta_mean = getattr(preds, f"fta_{side}").mean
+    fgm_p = torch.sigmoid(getattr(preds, f"fgm_probs_{side}"))
+    tpm_p = torch.sigmoid(getattr(preds, f"tpm_probs_{side}"))
+    ftm_p = torch.sigmoid(getattr(preds, f"ftm_probs_{side}"))
+    plays_p = getattr(preds, f"plays_gate_{side}").probs       # [B, P]
+    pts = plays_p * (2.0 * fga_mean * fgm_p + tpa_mean * tpm_p + fta_mean * ftm_p)
+    return (pts * mask).sum(dim=-1)                            # [B]
+
+
+def _team_pts_team_head(preds: BoxScoreDistribution) -> torch.Tensor:
+    """``pace * off_rtg / 100`` per side. Returns ``[B, 2]`` (home, away)."""
+    pace = preds.pace.mean.unsqueeze(-1)                       # [B, 1]
+    off = preds.off_rtg.mean                                   # [B, 2]
+    return pace * off / 100.0                                  # [B, 2]
 
 
 def composite_nll(
@@ -165,6 +206,28 @@ def composite_nll(
     else:
         per["embedding_pool"] = torch.zeros((), device=per["pace"].device)
 
+    # --- Coupling: Σ E[player_pts] ≈ pace * off_rtg / 100 ------------------
+    # Pull the player-allocation sum toward the team head's direct estimate
+    # of team PTS. The team head is empirically ~3-4 MAE units more accurate
+    # than the player sum (scripts/team_pts_diagnostic.py), so we detach
+    # that side and only update the per-player heads. Computed regardless
+    # of weight so it's visible in the per-head dict for monitoring.
+    #
+    # Smooth-L1 (Huber) — quadratic for residuals ≤ 1, linear beyond. An
+    # MSE term in physical-points units explodes (one bad batch where the
+    # team head and player sum differ by 30 contributes 900 to the loss);
+    # Smooth-L1 caps the per-game contribution at roughly |residual| - 0.5
+    # for large residuals, so the coupling can't dominate the composite
+    # NLL the way the MSE version did at λ=0.1.
+    coupling_weight = getattr(weights, "coupling", 0.0)
+    team_pts_th = _team_pts_team_head(preds).detach()        # [B, 2]
+    home_player_sum = _team_pts_player_sum(preds, "home", targets["home_mask"])
+    away_player_sum = _team_pts_player_sum(preds, "away", targets["away_mask"])
+    per["coupling"] = (
+        F.smooth_l1_loss(home_player_sum, team_pts_th[:, 0])
+        + F.smooth_l1_loss(away_player_sum, team_pts_th[:, 1])
+    ) / 2.0
+
     # --- Weighted sum -------------------------------------------------------
     total = (
         weights.pace * per["pace"]
@@ -172,6 +235,7 @@ def composite_nll(
         + weights.minutes * per["minutes"]
         + weights.gate * per["gate"]
         + weights.embedding_pool * per["embedding_pool"]
+        + coupling_weight * per["coupling"]
     )
     for stat in _COUNT_STATS:
         total = total + getattr(weights, stat) * per[stat]
