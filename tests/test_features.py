@@ -40,6 +40,7 @@ from nba_sim.features.context import (
 from nba_sim.features.matchup import (
     add_matchup_features,
     head_to_head_last_margin,
+    opponent_blocks_allowed_by_position,
     opponent_defrtg_by_position,
 )
 from nba_sim.features.rolling import (
@@ -881,6 +882,65 @@ def test_opp_defrtg_by_pos_resets_across_seasons() -> None:
     s2 = out.filter(pl.col("game_id") == "S2G1")
     for v in s2["opp_def_rtg_vs_pos"]:
         assert v is None
+
+
+# ===========================================================================
+# opponent_blocks_allowed_by_position
+# ===========================================================================
+
+def test_opp_blk_allowed_by_pos_returns_empty_for_empty_input() -> None:
+    out = opponent_blocks_allowed_by_position(pl.DataFrame(), pl.DataFrame())
+    assert out.is_empty()
+
+
+def test_opp_blk_allowed_by_pos_first_game_is_null() -> None:
+    """First game in season → cum_games_prior=0 → None (cold-start)."""
+    games, pb, _tb = _matchup_setup_two_games()
+    out = opponent_blocks_allowed_by_position(pb, games)
+    g1 = out.filter(pl.col("game_id") == "G1")
+    assert g1.height > 0
+    for v in g1["opp_blk_allowed_vs_pos"]:
+        assert v is None
+
+
+def test_opp_blk_allowed_by_pos_second_game_is_hand_computed() -> None:
+    """G2: opp=BOS (team 1). At G1, LAL's G recorded 3 blocks, LAL's F got 1.
+    BOS has played 1 prior game at each position.
+        opp_blk_allowed_vs_pos(opp=BOS, G2, G) = 3 / 1 = 3.0
+        opp_blk_allowed_vs_pos(opp=BOS, G2, F) = 1 / 1 = 1.0
+
+    Symmetrically, opp=LAL at G2:
+        opp_blk_allowed_vs_pos(opp=LAL, G2, G) = (BOS G's G1 blk) / 1
+        opp_blk_allowed_vs_pos(opp=LAL, G2, F) = (BOS F's G1 blk) / 1
+    """
+    games = pl.DataFrame([
+        _full_game("G1", dt.date(2023, 1, 1), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=110, away_pts=100),
+        _full_game("G2", dt.date(2023, 1, 10), 2022,
+                   home_team_id=1, away_team_id=2, home_pts=115, away_pts=105),
+    ])
+    pb = pl.DataFrame([
+        _pbox_row("G1", 100, 1, blk=2),   # BOS G — 2 blocks vs LAL
+        _pbox_row("G1", 101, 1, blk=4),   # BOS F — 4 blocks vs LAL
+        _pbox_row("G1", 200, 2, blk=3),   # LAL G — 3 blocks vs BOS
+        _pbox_row("G1", 201, 2, blk=1),   # LAL F — 1 block  vs BOS
+        _pbox_row("G2", 100, 1, blk=0),
+        _pbox_row("G2", 101, 1, blk=0),
+        _pbox_row("G2", 200, 2, blk=0),
+        _pbox_row("G2", 201, 2, blk=0),
+    ]).with_columns(
+        pl.when(pl.col("player_id").is_in([100, 200])).then(pl.lit("G"))
+        .otherwise(pl.lit("F"))
+        .alias("position")
+    )
+    out = opponent_blocks_allowed_by_position(pb, games)
+    g2 = out.filter(pl.col("game_id") == "G2")
+    by_key = {(r["opp_team_id"], r["position"]): r["opp_blk_allowed_vs_pos"]
+              for r in g2.iter_rows(named=True)}
+    assert by_key[(1, "G")] == pytest.approx(3.0)
+    assert by_key[(1, "F")] == pytest.approx(1.0)
+    assert by_key[(2, "G")] == pytest.approx(2.0)
+    assert by_key[(2, "F")] == pytest.approx(4.0)
 
 
 # ===========================================================================

@@ -5,7 +5,7 @@
 architecture: hierarchical    # {baseline | hierarchical}
 
 dims:
-  d_player_raw: 53            # pre-encoder feature vector per player (45 numeric + 4 pos + 4 bool)
+  d_player_raw: 55            # pre-encoder feature vector per player (47 numeric + 4 pos + 4 bool)
   d_player: 64                # player feature embedding dim (after encoder)
   d_team: 192                 # pooled team representation dim (tune5 Run 01)
   d_context_raw: 24           # raw context feature vector (pre-encoder)

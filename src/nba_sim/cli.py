@@ -271,12 +271,88 @@ def simulate(
     home: str = typer.Option(..., help="3-letter home team abbr"),
     away: str = typer.Option(..., help="3-letter away team abbr"),
     date: str = typer.Option(..., help="ISO YYYY-MM-DD"),
-    n_samples: int = typer.Option(1),
-    seed: int | None = typer.Option(None),
-    checkpoint: str = typer.Option("models/best.pt"),
+    n_samples: int = typer.Option(1, help="1=single sample; >1=ensemble"),
+    seed: int | None = typer.Option(None, help="RNG seed for determinism"),
+    checkpoint: Path = typer.Option(Path("models/best.pt")),
+    train_parquet: Path = typer.Option(Path("data/processed/train.parquet")),
+    val_parquet: Path = typer.Option(Path("data/processed/val.parquet")),
+    test_parquet: Path = typer.Option(Path("data/processed/test.parquet")),
+    device: str = typer.Option("auto", help="{auto|cpu|cuda}"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Simulate a single game (or an ensemble). Prints to stdout."""
-    raise NotImplementedError
+    """Simulate a single game (or an ensemble). Prints box score to stdout.
+
+    The (home, away, date) tuple must currently correspond to a game
+    present in the val or test split. Custom rosters / arbitrary dates
+    are a v2 feature (see simulate/api.py docstring).
+    """
+    _setup_logging(verbose)
+    from nba_sim.simulate.api import simulate_game
+
+    for label, p in (
+        ("checkpoint", checkpoint),
+        ("train", train_parquet),
+        ("val", val_parquet),
+    ):
+        if not p.exists():
+            raise typer.BadParameter(f"{label} not found: {p}")
+
+    test_arg = test_parquet if test_parquet.exists() else None
+
+    result = simulate_game(
+        home_team=home,
+        away_team=away,
+        date=date,
+        n_samples=n_samples,
+        seed=seed,
+        device=device,
+        checkpoint=checkpoint,
+        train_parquet=train_parquet,
+        val_parquet=val_parquet,
+        test_parquet=test_arg,
+    )
+
+    if n_samples == 1:
+        _print_box_score(result)
+    else:
+        typer.echo(f"== ensemble of {n_samples} samples ==")
+        typer.echo("\nMEAN box score:")
+        _print_box_score(result.mean)
+        typer.echo("\n10th/90th percentile team totals:")
+        for side, lo, hi in (
+            ("home", result.interval_low.home, result.interval_high.home),
+            ("away", result.interval_low.away, result.interval_high.away),
+        ):
+            typer.echo(
+                f"  {lo.team:>3}: pts [{lo.pts}, {hi.pts}], "
+                f"pace [{lo.pace:.1f}, {hi.pace:.1f}], "
+                f"off_rtg [{lo.off_rtg:.1f}, {hi.off_rtg:.1f}]"
+            )
+
+
+def _print_box_score(bs) -> None:  # type: ignore[no-untyped-def]
+    """One-game stdout rendering. Tight columns, top-of-rotation focus."""
+    for side_name, side in (("HOME", bs.home), ("AWAY", bs.away)):
+        typer.echo(
+            f"\n[{side_name}] {side.team}: "
+            f"PTS={side.pts}  pace={side.pace:.1f}  "
+            f"off_rtg={side.off_rtg:.1f}  def_rtg={side.def_rtg:.1f}"
+        )
+        typer.echo(
+            f"  {'Player':<22} {'MIN':>5} {'PTS':>4} "
+            f"{'FG':>7} {'3P':>7} {'FT':>7} "
+            f"{'REB':>4} {'AST':>4} {'STL':>4} {'BLK':>4} {'TOV':>4}"
+        )
+        # Sort by minutes desc — top of rotation first.
+        for p in sorted(side.players, key=lambda x: -x.minutes):
+            if p.minutes <= 0.0:
+                continue
+            typer.echo(
+                f"  {p.player_name[:22]:<22} "
+                f"{p.minutes:>5.1f} {p.pts:>4} "
+                f"{p.fgm:>2}/{p.fga:<4} {p.tpm:>2}/{p.tpa:<4} {p.ftm:>2}/{p.fta:<4} "
+                f"{p.reb:>4} {p.ast:>4} {p.stl:>4} {p.blk:>4} {p.tov:>4}"
+            )
 
 
 @app.command("cache-stats")

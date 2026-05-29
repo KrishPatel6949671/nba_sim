@@ -47,7 +47,7 @@ from torch.utils.data import Dataset
 # corresponding output tensor.
 # ---------------------------------------------------------------------------
 
-# 45 numeric player features (z-score standardized).
+# 47 numeric player features (z-score standardized).
 _PLAYER_NUMERIC_COLS: tuple[str, ...] = (
     # Rolling form (12).
     "p_min_avg_5", "p_min_avg_10", "p_min_avg_20",
@@ -71,6 +71,12 @@ _PLAYER_NUMERIC_COLS: tuple[str, ...] = (
     # ftm/fta/blk gap where rolling-N averages don't stabilize the signal.
     "p_fg_pct_career", "p_tp_pct_career", "p_ft_pct_career",
     "p_blk_per36_career", "p_ft_rate_10",
+    # Position-matchup features (2). Both are per-(opp_team, position)
+    # cumulative-prior aggregates. opp_def_rtg_vs_pos was historically
+    # only consumed by the GLM baseline; opp_blk_allowed_vs_pos added
+    # in the same pass to give BLK the situational signal that the
+    # career rate alone doesn't supply.
+    "opp_def_rtg_vs_pos", "opp_blk_allowed_vs_pos",
 )
 
 # 4 position one-hot buckets. ``""`` catches missing / unrecognized.
@@ -79,11 +85,11 @@ _POSITION_TOKENS: tuple[str, ...] = ("G", "F", "C", "")
 # 4 passthrough booleans (cast to 0/1 float).
 _PLAYER_BOOL_COLS: tuple[str, ...] = ("is_starter", "dnp", "is_home", "b2b")
 
-# Sanity: 45 + 4 + 4 = 53 = d_player_raw in configs/model.yaml.
+# Sanity: 47 + 4 + 4 = 55 = d_player_raw in configs/model.yaml.
 _D_PLAYER_RAW: int = (
     len(_PLAYER_NUMERIC_COLS) + len(_POSITION_TOKENS) + len(_PLAYER_BOOL_COLS)
 )
-assert _D_PLAYER_RAW == 53, _D_PLAYER_RAW
+assert _D_PLAYER_RAW == 55, _D_PLAYER_RAW
 
 # Context numerics (5) standardized; rest of d_context_raw=24 is one-hots +
 # cyclic encodings + bools assembled inline in ``_build_context``.

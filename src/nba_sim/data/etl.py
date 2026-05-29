@@ -47,6 +47,7 @@ from nba_sim.data.schema import (
 from nba_sim.features.context import add_context_features
 from nba_sim.features.matchup import (
     add_matchup_features,
+    opponent_blocks_allowed_by_position,
     opponent_defrtg_by_position,
 )
 from nba_sim.features.rolling import (
@@ -552,18 +553,21 @@ def build_feature_tables(season: int, *, refresh: bool = False) -> Path:
     team_features = team_rolling(team_box, games)
     player_rolling_out = player_rolling(player_box, games, team_box=team_box)
 
-    # DefRtg-vs-position is a per-(opp_team, game, position) lookup table.
-    # We compute it once per season and pass it into add_matchup_features
-    # for the join — see opponent_defrtg_by_position docstring for why it's
-    # separate from add_matchup_features (different input dependencies).
+    # Position-matchup lookup tables. Both are per-(opp_team, game,
+    # position) and get joined into add_matchup_features on those keys.
+    # Kept separate from add_matchup_features because each needs raw
+    # player_box / team_box that the matchup function doesn't take.
     defrtg_vs_pos = opponent_defrtg_by_position(player_box, games, team_box)
+    blk_allowed_vs_pos = opponent_blocks_allowed_by_position(player_box, games)
 
     # Stitch matchup features onto the player rolling frame. The combined
     # frame is what we persist as player_features.parquet — same grain
-    # (one row per player-game), now with opp_*/h2h_/opp_def_rtg_vs_pos
-    # columns added in.
+    # (one row per player-game), now with opp_*/h2h_/opp_def_rtg_vs_pos/
+    # opp_blk_allowed_vs_pos columns added in.
     player_features = add_matchup_features(
-        player_rolling_out, team_features, games, defrtg_vs_pos=defrtg_vs_pos
+        player_rolling_out, team_features, games,
+        defrtg_vs_pos=defrtg_vs_pos,
+        blk_allowed_vs_pos=blk_allowed_vs_pos,
     )
 
     # Context features (rest, b2b, density, altitude, travel, calendar)

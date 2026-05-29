@@ -1,20 +1,26 @@
 """Matchup-level features.
 
 Features (PLAN.md §3.1):
-    opp_def_rtg_10          — opponent's rolling DefRtg over their last 10 games
-    opp_pace_10             — opponent's rolling pace over their last 10 games
-    opp_def_rtg_vs_pos      — opp's season DefRtg allowed to player's position
-    h2h_last_meeting_margin — point margin in the two teams' most recent
-                              prior meeting, viewed from the current home
-                              team's perspective. 0 if no prior meeting.
+    opp_def_rtg_10            — opponent's rolling DefRtg over their last 10 games
+    opp_pace_10               — opponent's rolling pace over their last 10 games
+    opp_def_rtg_vs_pos        — opp's season DefRtg allowed to player's position
+    opp_blk_allowed_vs_pos    — opp's season blocks-per-game allowed to
+                                player's position. Anchors the BLK prediction
+                                to the situational signal (some teams give up
+                                lots of blocks at C; others get blocked at G).
+    h2h_last_meeting_margin   — point margin in the two teams' most recent
+                                prior meeting, viewed from the current home
+                                team's perspective. 0 if no prior meeting.
 
 Leakage discipline (PLAN.md §3.2):
     Every aggregate uses ``date < target_date``:
       * Opponent rolling stats come from ``team_rolling``, which already
         ``shift(1)``s internally — opp's value at game G covers opp's games
         strictly before G.
-      * ``opp_def_rtg_vs_pos`` uses the ``cum_sum - current`` idiom inside
-        ``(opp_team, season, position)``, so the target game is excluded.
+      * Position-conditioned features (``opp_def_rtg_vs_pos``,
+        ``opp_blk_allowed_vs_pos``) use the ``cum_sum - current`` idiom
+        inside ``(opp_team, season, position)``, so the target game is
+        excluded.
       * ``h2h_last_meeting_margin`` shifts back one row per unordered
         ``(team_a, team_b)`` pair — it can never see the target game.
 
@@ -218,6 +224,83 @@ def opponent_defrtg_by_position(
 
 
 # ---------------------------------------------------------------------------
+# opponent_blocks_allowed_by_position
+# ---------------------------------------------------------------------------
+
+def opponent_blocks_allowed_by_position(
+    player_box: pl.DataFrame,
+    games: pl.DataFrame,
+) -> pl.DataFrame:
+    """Per-(opp_team, game, position) cumulative-prior blocks-per-game allowed.
+
+    Computed as::
+
+        opp_blk_allowed_vs_pos
+          = cum_blk_by_position_vs_opp_prior(opp_team, season, position)
+            / cum_games_at_position_vs_opp_prior(opp_team, season, position)
+
+    Both numerator and denominator strictly exclude the target game.
+
+    Numerator: sum of blocks recorded by opposing players of the given
+    position against ``opp_team``, accumulated within the season. (When a
+    center on team A plays against team B and records 3 blocks, that
+    contributes +3 to ``opp_blk_allowed_vs_pos[B, C]``.)
+    Denominator: count of prior games in which a player at the given
+    position played against ``opp_team``.
+
+    Mean blocks per game is more interpretable than a per-100-poss rate
+    here because BLK is a low-mean rare event and the per-100-poss scale
+    would make tiny differences look large. The model z-scores the
+    column either way, so the choice of physical unit is a presentation
+    detail, not a modeling one.
+
+    Position ``""`` (missing-data signal in V3 box scores) is excluded,
+    same as :func:`opponent_defrtg_by_position`.
+
+    Returns a frame with one row per ``(opp_team_id, game_id, position)``
+    and a single feature column ``opp_blk_allowed_vs_pos``. Joined onto
+    per-player frames by :func:`add_matchup_features`.
+    """
+    if player_box.is_empty() or games.is_empty():
+        return pl.DataFrame()
+
+    opp_map = _opponent_map(games)
+    pb = player_box.join(opp_map, on=["game_id", "team_id"], how="inner")
+    pb = pb.filter(pl.col("position") != "")
+    if pb.is_empty():
+        return pl.DataFrame()
+
+    # Per-(opp_team, game, position) blocks. Same aggregation-then-cumsum
+    # idiom as opponent_defrtg_by_position — the cum_sum partition wants
+    # one row per game per (opp_team, position) so the shift logic is
+    # well-defined.
+    blk = pb.group_by(
+        ["opp_team_id", "season", "date", "game_id", "position"]
+    ).agg(pl.col("blk").sum().alias("blk_allowed"))
+
+    blk = blk.sort(["opp_team_id", "season", "position", "date", "game_id"])
+    blk = blk.with_columns([
+        (
+            pl.col("blk_allowed").cum_sum().over(["opp_team_id", "season", "position"])
+            - pl.col("blk_allowed")
+        ).alias("cum_blk_prior"),
+        (
+            pl.col("date").cum_count().over(["opp_team_id", "season", "position"]) - 1
+        ).cast(pl.Int64).alias("cum_games_prior"),
+    ])
+
+    blk = blk.with_columns(
+        pl.when(pl.col("cum_games_prior") > 0)
+        .then(pl.col("cum_blk_prior") / pl.col("cum_games_prior"))
+        .otherwise(None)
+        .alias("opp_blk_allowed_vs_pos")
+    )
+    return blk.select(
+        ["opp_team_id", "game_id", "position", "opp_blk_allowed_vs_pos"]
+    )
+
+
+# ---------------------------------------------------------------------------
 # add_matchup_features
 # ---------------------------------------------------------------------------
 
@@ -227,20 +310,23 @@ def add_matchup_features(
     games: pl.DataFrame,
     *,
     defrtg_vs_pos: pl.DataFrame | None = None,
+    blk_allowed_vs_pos: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Join opponent-aware features onto per-player rows.
 
     Joins (each guarded — see notes below):
-        - ``opp_team_id``                from ``games`` via the long opp map
+        - ``opp_team_id``                  from ``games`` via the long opp map
         - ``opp_def_rtg_10`` / ``opp_pace_10``
-                                         from ``team_rolling`` renamed
-        - ``h2h_last_meeting_margin``    per-game, derived inline
-        - ``opp_def_rtg_vs_pos``         from ``defrtg_vs_pos`` if provided
+                                           from ``team_rolling`` renamed
+        - ``h2h_last_meeting_margin``      per-game, derived inline
+        - ``opp_def_rtg_vs_pos``           from ``defrtg_vs_pos`` if provided
+        - ``opp_blk_allowed_vs_pos``       from ``blk_allowed_vs_pos`` if provided
 
-    ``defrtg_vs_pos`` is passed in (not derived inline) because computing
-    it requires ``player_box`` and ``team_box``, which aren't in this
-    function's signature. The orchestrator (``build_feature_tables``)
-    calls :func:`opponent_defrtg_by_position` and passes the result here.
+    The two position-matchup tables are passed in (not derived inline)
+    because they require ``player_box`` which isn't in this function's
+    signature. The orchestrator (``build_feature_tables``) calls
+    :func:`opponent_defrtg_by_position` and
+    :func:`opponent_blocks_allowed_by_position` and passes results here.
 
     Args:
         per_player: per-(player, game) frame. Must include
@@ -251,13 +337,17 @@ def add_matchup_features(
         games: per-game header (Game schema).
         defrtg_vs_pos: optional output of
             :func:`opponent_defrtg_by_position`. When ``None`` the
-            position-matchup column is simply not added.
+            ``opp_def_rtg_vs_pos`` column is simply not added.
+        blk_allowed_vs_pos: optional output of
+            :func:`opponent_blocks_allowed_by_position`. When ``None`` the
+            ``opp_blk_allowed_vs_pos`` column is simply not added.
 
     Returns:
         ``per_player`` augmented with ``opp_team_id``, ``opp_def_rtg_10``,
-        ``opp_pace_10``, ``h2h_last_meeting_margin``, and (when provided)
-        ``opp_def_rtg_vs_pos``. Player rows with no opponent in the map
-        (i.e. game was filtered out as dropped) are themselves dropped.
+        ``opp_pace_10``, ``h2h_last_meeting_margin``, and the position-
+        matchup columns when their inputs are provided. Player rows with
+        no opponent in the map (i.e. game was filtered out as dropped)
+        are themselves dropped.
     """
     if per_player.is_empty():
         return per_player
@@ -286,10 +376,16 @@ def add_matchup_features(
         pl.col("h2h_last_meeting_margin").fill_null(0.0)
     )
 
-    # 4. Position matchup, if provided.
+    # 4. Position matchup tables, if provided.
     if defrtg_vs_pos is not None and not defrtg_vs_pos.is_empty():
         result = result.join(
             defrtg_vs_pos,
+            on=["game_id", "opp_team_id", "position"],
+            how="left",
+        )
+    if blk_allowed_vs_pos is not None and not blk_allowed_vs_pos.is_empty():
+        result = result.join(
+            blk_allowed_vs_pos,
             on=["game_id", "opp_team_id", "position"],
             how="left",
         )

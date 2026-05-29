@@ -35,7 +35,7 @@ from nba_sim.models.heads import (
 # the published config.
 B = 4
 P = 15
-D_P_RAW = 53
+D_P_RAW = 55
 D_PLAYER_EMBED = 32     # shared dim for role centroid AND player δ
 D_OUT = 64
 D_TEAM = 128
