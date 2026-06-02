@@ -355,6 +355,65 @@ def _print_box_score(bs) -> None:  # type: ignore[no-untyped-def]
             )
 
 
+@app.command()
+def refresh(
+    as_of: str | None = typer.Option(
+        None, "--as-of", help="ISO YYYY-MM-DD; default = day after the latest interim game."
+    ),
+    force: bool = typer.Option(
+        False, help="Rebuild even if the snapshot already covers the latest interim data."
+    ),
+    offline: bool = typer.Option(
+        True,
+        help="Derive rosters from interim appearances (no nba_api). Live fetch lands in Phase 8.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Refresh the local snapshot so the simulator can run for games that
+    haven't happened yet.
+
+    Builds ``data/snapshot/`` (rosters, player/team features, team_lastgame,
+    as_of.json) for one as-of date. With no ``--as-of`` the date defaults to
+    the day after the most recent interim game. Atomic: a partial run never
+    replaces a good snapshot. After writing, prints the status block.
+    """
+    _setup_logging(verbose)
+    # Imported here (not at module top) to keep ``nba-sim --help`` fast —
+    # the refresh path pulls in polars + the model's feature layout.
+    from nba_sim.snapshot.refresh import refresh as run_refresh
+    from nba_sim.snapshot.status import format_status, read_provenance
+
+    if as_of is not None:
+        import datetime as _dt
+
+        try:
+            _dt.date.fromisoformat(as_of)
+        except ValueError as e:
+            raise typer.BadParameter(f"--as-of must be ISO YYYY-MM-DD: {e}") from e
+
+    try:
+        dest = run_refresh(as_of=as_of, force=force, offline=offline)
+    except NotImplementedError as e:
+        # e.g. --no-offline before the Phase 8 live path exists.
+        raise typer.BadParameter(str(e)) from e
+
+    typer.echo(f"snapshot written to {dest}\n")
+    typer.echo(format_status(read_provenance(dest)))
+
+
+@app.command("snapshot-status")
+def snapshot_status() -> None:
+    """Print the local snapshot's provenance (``data/snapshot/as_of.json``)
+    in human-readable form, with a freshness verdict."""
+    from nba_sim.snapshot.status import format_status, read_provenance
+
+    try:
+        provenance = read_provenance()
+    except FileNotFoundError as e:
+        raise typer.BadParameter(str(e)) from e
+    typer.echo(format_status(provenance))
+
+
 @app.command("cache-stats")
 def cache_stats() -> None:
     """Print size and per-endpoint counts for the nba_api cache."""

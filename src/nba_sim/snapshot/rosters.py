@@ -61,6 +61,23 @@ NULLABLE_BIO_COLUMNS: tuple[str, ...] = (
     "birth_date",
 )
 
+# The exact dtype contract for rosters.parquet (§13.3). Used to (a) build a
+# correctly-typed empty frame when there are no appearances and (b) cast the
+# assembled frame so the parquet's dtypes never drift from the documented
+# schema. Order matches ROSTER_COLUMNS.
+_ROSTER_SCHEMA: dict[str, pl.DataType] = {
+    "team_id": pl.Int64(),
+    "team_abbr": pl.Utf8(),
+    "player_id": pl.Int64(),
+    "player_name": pl.Utf8(),
+    "position": pl.Utf8(),
+    "height_in": pl.Float64(),
+    "weight_lbs": pl.Float64(),
+    "jersey": pl.Utf8(),
+    "experience_years": pl.Int64(),
+    "birth_date": pl.Date(),
+}
+
 
 class RawRosterEntry(BaseModel):
     """Mirror of a ``CommonTeamRoster`` row (dataset 0). Loose / API-shaped,
@@ -87,14 +104,23 @@ class RawRosterEntry(BaseModel):
 
 
 def normalize_position(pos: str | None) -> str:
-    """Map a raw POSITION onto the ``{"G", "F", "C", ""}`` token space the
-    model encoder and the position-matchup joins use.
+    """Map a raw POSITION onto the ``{"G", "F", "C", ""}`` token space.
 
-    ``CommonTeamRoster`` returns hyphenated combos ("G-F", "F-C", "C-F");
-    box scores return single letters or "". We keep the **primary** group
-    (text before the first "-"); anything unrecognized maps to "".
+    ``CommonTeamRoster`` returns hyphenated combos ("G-F", "F-C", "C-F"); we
+    keep the **primary** group (text before the first "-"), upper-cased;
+    anything unrecognized (or empty) maps to "".
+
+    Used by the **live** (Phase 8) path only. The offline path stores the raw
+    box-score position verbatim, because that is exactly what the v1
+    training pipeline fed the encoder: ``_position_one_hot`` buckets only
+    ``{G, F, C, ""}`` and treats combos like "F-C" as all-zeros, and the
+    position-matchup features group on the raw string. Normalizing offline
+    would change the very encoding the model was trained on.
     """
-    raise NotImplementedError("TODO(task 3): normalize CommonTeamRoster positions")
+    if not pos:
+        return ""
+    primary = pos.split("-", 1)[0].strip().upper()
+    return primary if primary in {"G", "F", "C"} else ""
 
 
 def parse_height_to_inches(height: str | None) -> float | None:
@@ -103,7 +129,16 @@ def parse_height_to_inches(height: str | None) -> float | None:
     Returns ``None`` on empty / malformed input. Only the live (Phase 8)
     path populates height; offline rows leave it null.
     """
-    raise NotImplementedError("TODO(task 3 / Phase 8): parse HEIGHT")
+    if not height:
+        return None
+    parts = height.split("-", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        feet, inches = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    return float(feet * 12 + inches)
 
 
 def build_rosters(
@@ -143,6 +178,53 @@ def build_rosters(
         raise NotImplementedError(
             "live CommonTeamRoster fetch is Phase 8; pass offline=True"
         )
-    raise NotImplementedError(
-        "TODO(task 3): derive (team_id, player_id) roster from interim player_box"
+
+    # Box scores carry only game_id; pull date/season off the game header so we
+    # can apply the leakage rule (date < as_of) and restrict to the as-of
+    # season. inner join also drops any appearance whose game we don't have a
+    # header for. games has season/date and player_box has neither, so there's
+    # no column clash.
+    appearances = player_box.join(
+        games.select(["game_id", "date", "season"]), on="game_id", how="inner"
+    ).filter((pl.col("date") < as_of_date) & (pl.col("season") == season))
+
+    if appearances.is_empty():
+        return pl.DataFrame(schema=_ROSTER_SCHEMA)
+
+    # Most-recent value wins for trade / name-change churn: sort ascending so
+    # `.last()` within each (team, player) group is the latest appearance.
+    # Polars preserves input row order within groups, so this is well-defined.
+    appearances = appearances.sort(["date", "game_id"])
+
+    identity = appearances.group_by(["team_id", "player_id"]).agg(
+        team_abbr=pl.col("team_abbr").last(),
+        player_name=pl.col("player_name").last(),
     )
+
+    # Position: most recent *non-empty* box position (a player can have ""
+    # in a game where they came off the bench). Left-join so a player who is
+    # always "" still appears, with position "".
+    positions = (
+        appearances.filter(pl.col("position") != "")
+        .group_by(["team_id", "player_id"])
+        .agg(position=pl.col("position").last())
+    )
+
+    out = (
+        identity.join(positions, on=["team_id", "player_id"], how="left")
+        .with_columns(
+            pl.col("position").fill_null(""),
+            # Bio is unavailable from box scores — null at the documented dtype.
+            pl.lit(None, dtype=pl.Float64).alias("height_in"),
+            pl.lit(None, dtype=pl.Float64).alias("weight_lbs"),
+            pl.lit(None, dtype=pl.Utf8).alias("jersey"),
+            pl.lit(None, dtype=pl.Int64).alias("experience_years"),
+            pl.lit(None, dtype=pl.Date).alias("birth_date"),
+        )
+        # Select in ROSTER_COLUMNS order and pin every dtype in one pass
+        # (_ROSTER_SCHEMA is keyed in that order) — guarantees the §13.3
+        # column + dtype contract.
+        .select([pl.col(c).cast(dt) for c, dt in _ROSTER_SCHEMA.items()])
+        .sort(["team_id", "player_id"])
+    )
+    return out
