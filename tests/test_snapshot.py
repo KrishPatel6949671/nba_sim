@@ -736,9 +736,46 @@ def test_offline_live_feature_equivalence(
 # Phase 8 — network / slow (full live refresh)
 # ---------------------------------------------------------------------------
 
+
+def _require_network(host: str = "stats.nba.com", port: int = 443) -> None:
+    """Skip unless ``host:port`` accepts a TCP connection (a short probe)."""
+    import socket
+
+    try:
+        socket.create_connection((host, port), timeout=3).close()
+    except OSError:
+        pytest.skip(f"no network access to {host}:{port}")
+
+
 @pytest.mark.slow
 @pytest.mark.network
-def test_refresh_under_30s() -> None:
-    """Full 30-team live refresh ≤ 30 s, rate-limited at 0.6 s/req (§12).
-    Phase 8."""
-    pytest.skip("Phase 8: live nba_api refresh")
+def test_refresh_under_30s(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Full 30-team live refresh ≤ 30 s, rate-limited at 0.6 s/req (§12 / §19).
+
+    Reads the real ``data/interim`` (skips if absent) and hits the live
+    nba_api (skips if unreachable). The snapshot is written into ``tmp_path``
+    so the user's real ``data/snapshot`` is never touched. Without network /
+    artifacts (CI) it skips cleanly; the ``network`` marker also keeps it out
+    of a ``-m "not network"`` run.
+    """
+    import time
+
+    from nba_sim.data.etl import interim_dir
+    from nba_sim.snapshot.refresh import _discover_seasons
+    from nba_sim.snapshot.refresh import refresh as run_refresh
+
+    if not _discover_seasons(interim_dir()):
+        pytest.skip("no interim seasons on disk — run the v1 ETL first")
+    _require_network()
+
+    # Redirect only the snapshot output; read the real interim + fetch cache.
+    monkeypatch.setenv("NBA_SIM_SNAPSHOT_DIR", str(tmp_path / "snapshot"))
+
+    start = time.monotonic()
+    dest = run_refresh(offline=False, force=True)
+    elapsed = time.monotonic() - start
+
+    prov = json.loads((dest / AS_OF_FILENAME).read_text())
+    assert prov["source"] == "nba_api+interim"
+    assert prov["n_teams"] == 30, f"expected 30 teams, got {prov['n_teams']}"
+    assert elapsed <= 30.0, f"live refresh took {elapsed:.1f}s (> 30s budget)"
