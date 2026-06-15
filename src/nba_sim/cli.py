@@ -384,8 +384,14 @@ def refresh(
         False, help="Rebuild even if the snapshot already covers the latest interim data."
     ),
     offline: bool = typer.Option(
-        True,
-        help="Derive rosters from interim appearances (no nba_api). Live fetch lands in Phase 8.",
+        False,
+        help="Derive rosters from interim appearances instead of fetching live "
+        "CommonTeamRoster (no nba_api). Default is the live nba_api+interim build.",
+    ),
+    refresh_cache: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Bypass the fetch cache for the roster/player endpoints (live path only).",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
@@ -393,9 +399,12 @@ def refresh(
     haven't happened yet.
 
     Builds ``data/snapshot/`` (rosters, player/team features, team_lastgame,
-    as_of.json) for one as-of date. With no ``--as-of`` the date defaults to
-    the day after the most recent interim game. Atomic: a partial run never
-    replaces a good snapshot. After writing, prints the status block.
+    as_of.json) for one as-of date. By default rosters are fetched live from
+    ``nba_api`` (``CommonTeamRoster`` per team); pass ``--offline`` to derive
+    them from interim appearances instead (no network). With no ``--as-of``
+    the date defaults to the day after the most recent interim game. Atomic:
+    a partial run never replaces a good snapshot. After writing, prints the
+    status block.
     """
     _setup_logging(verbose)
     # Imported here (not at module top) to keep ``nba-sim --help`` fast —
@@ -411,12 +420,9 @@ def refresh(
         except ValueError as e:
             raise typer.BadParameter(f"--as-of must be ISO YYYY-MM-DD: {e}") from e
 
-    try:
-        dest = run_refresh(as_of=as_of, force=force, offline=offline)
-    except NotImplementedError as e:
-        # e.g. --no-offline before the Phase 8 live path exists.
-        raise typer.BadParameter(str(e)) from e
-
+    dest = run_refresh(
+        as_of=as_of, force=force, offline=offline, refresh_cache=refresh_cache
+    )
     typer.echo(f"snapshot written to {dest}\n")
     typer.echo(format_status(read_provenance(dest)))
 

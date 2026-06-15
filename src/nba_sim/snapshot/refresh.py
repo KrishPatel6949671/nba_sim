@@ -97,6 +97,7 @@ from nba_sim.snapshot import (
     AS_OF_FILENAME,
     CODE_VERSION,
     PLAYER_FEATURES_FILENAME,
+    QA_REPORT_FILENAME,
     ROSTERS_FILENAME,
     TEAM_FEATURES_FILENAME,
     TEAM_LASTGAME_FILENAME,
@@ -598,29 +599,36 @@ def _write_snapshot_atomic(
     provenance: dict[str, Any],
     *,
     dest: Path,
+    qa_report: dict[str, Any] | None = None,
 ) -> None:
     """Stage all parquets under ``dest/.tmp/`` then promote into place (§14.4).
 
-    Build phase writes every parquet into ``dest/.tmp/`` and ``as_of.json``
-    last; only once the build fully succeeds do we promote the files into
-    ``dest`` with ``os.replace`` (atomic per file on the same filesystem),
-    ``as_of.json`` **last**. So a crash during the build never touches the
-    live ``dest`` (no new ``as_of.json`` appears), and the completeness marker
-    becoming visible implies every parquet beside it is already the new one.
+    Build phase writes every parquet into ``dest/.tmp/``, then ``qa_report.json``
+    (live only — the rejected roster rows), and ``as_of.json`` last; only once
+    the build fully succeeds do we promote the files into ``dest`` with
+    ``os.replace`` (atomic per file on the same filesystem), ``as_of.json``
+    **last**. So a crash during the build never touches the live ``dest`` (no
+    new ``as_of.json`` appears), and the completeness marker becoming visible
+    implies every file beside it is already the new one.
     """
     staging = dest / TMP_DIRNAME
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=True)
 
-    # Build phase — everything into staging; as_of.json staged last.
+    # Build phase — parquets, then qa_report (if any), then as_of.json last.
     for filename, df in frames.items():
         df.write_parquet(staging / filename)
+    if qa_report is not None:
+        (staging / QA_REPORT_FILENAME).write_text(json.dumps(qa_report, indent=2))
     (staging / AS_OF_FILENAME).write_text(json.dumps(provenance, indent=2))
 
-    # Promote phase — move staged files into dest, as_of.json last.
+    # Promote phase — move staged files into dest, qa_report just before the
+    # as_of.json completeness marker (which goes last).
     for filename in frames:
         os.replace(staging / filename, dest / filename)
+    if qa_report is not None:
+        os.replace(staging / QA_REPORT_FILENAME, dest / QA_REPORT_FILENAME)
     os.replace(staging / AS_OF_FILENAME, dest / AS_OF_FILENAME)
 
     shutil.rmtree(staging, ignore_errors=True)
@@ -635,6 +643,7 @@ def refresh(
     as_of: str | _dt.date | None = None,
     force: bool = False,
     offline: bool = True,
+    refresh_cache: bool = False,
     snapshot_root: Path | None = None,
     interim_root: Path | None = None,
 ) -> Path:
@@ -655,8 +664,13 @@ def refresh(
     force
         Bypass the "snapshot already newer than interim" skip.
     offline
-        Phase 6 default ``True`` — derive rosters from interim, no nba_api.
-        The live fetch path lands in Phase 8.
+        Default ``True`` — derive rosters from interim appearances (no
+        nba_api). ``False`` fetches live ``CommonTeamRoster`` per team and
+        also writes ``qa_report.json`` with any rejected rows.
+    refresh_cache
+        Live path only: bypass the on-disk fetch cache for the roster /
+        player-info endpoints (the ``nba-sim refresh --refresh`` flag,
+        consistent with v1 ``nba-sim fetch --refresh``).
     snapshot_root, interim_root
         Override roots (tests redirect via ``NBA_SIM_SNAPSHOT_DIR`` /
         ``NBA_SIM_INTERIM_DIR``); default to the env-aware helpers.
@@ -688,13 +702,15 @@ def refresh(
         seasons, as_of_date=as_of_date, interim_root=iroot
     )
 
-    # Stage B — rosters (offline = derive from interim appearances).
-    rosters = build_rosters(
+    # Stage B — rosters (offline = derive from interim appearances; live =
+    # CommonTeamRoster per team, with rejected rows collected for QA).
+    rosters, roster_qa = build_rosters(
         games=games,
         player_box=player_box,
         as_of_date=as_of_date,
         season=season,
         offline=offline,
+        refresh=refresh_cache,
     )
 
     # Stage C — synthetic-row features + team_lastgame.
@@ -719,7 +735,17 @@ def refresh(
         offline=offline,
     )
 
-    # Stage D — atomic write.
+    # Stage D — atomic write. Live refreshes also emit qa_report.json with the
+    # rejected roster rows / failed team fetches; offline has none, so it keeps
+    # writing exactly the four parquets + as_of.json (Phase 6/7 behavior).
+    qa_report: dict[str, Any] | None = None
+    if not offline:
+        qa_report = {
+            "as_of_date": as_of_date.isoformat(),
+            "generated_at": _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "n_malformed": len(roster_qa),
+            "malformed": roster_qa,
+        }
     _write_snapshot_atomic(
         {
             ROSTERS_FILENAME: rosters,
@@ -729,6 +755,7 @@ def refresh(
         },
         provenance,
         dest=sroot,
+        qa_report=qa_report,
     )
     logger.info(
         "refresh: wrote snapshot to %s (%d teams, %d players, as_of %s)",

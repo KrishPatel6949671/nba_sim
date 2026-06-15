@@ -308,7 +308,7 @@ def test_synthetic_target_rows_use_sentinel_ids(snapshot_env: _Fixture) -> None:
     games, player_box, team_box = _load_interim(
         [snapshot_env.season], as_of_date=as_of_date, interim_root=snapshot_env.interim_root
     )
-    rosters = build_rosters(
+    rosters, _qa = build_rosters(
         games=games, player_box=player_box, as_of_date=as_of_date, season=season
     )
     syn_player_box, syn_team_box, syn_player_games, syn_team_games = _build_synthetic_target(
@@ -545,6 +545,191 @@ def test_context_vector_matches_v1_at_known_date(
     snap_p10 = batch["home_player_feats"][0, 0, keep]
     v1_p10 = v1["home_player_feats"][0, keep]
     assert torch.allclose(snap_p10, v1_p10, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — live roster resolution (non-network: fetch layer is mocked)
+# ---------------------------------------------------------------------------
+#
+# build_rosters(offline=False) fetches CommonTeamRoster per team. These tests
+# inject canned frames by monkeypatching the fetch seam (rosters._get_team_list
+# / rosters.fetch_roster / rosters.fetch_player_info, mirroring the v1 ETL's
+# _stub_fetchers pattern), so they never touch the network.
+
+
+def _roster_df(team_id: int, players: list[tuple[int, str, str]]) -> pl.DataFrame:
+    """A canned ``CommonTeamRoster`` dataset-0 frame for one team.
+
+    ``players`` is ``[(player_id, player_name, position), ...]``; bio columns
+    are filled with valid values so the CommonPlayerInfo backfill never fires.
+    Column names mirror the real endpoint (see RawRosterEntry).
+    """
+    rows = [
+        {
+            "TeamID": team_id, "SEASON": "2023", "LeagueID": "00",
+            "PLAYER": name, "PLAYER_SLUG": name.lower().replace(" ", "-"),
+            "NUM": str(pid), "POSITION": pos, "HEIGHT": "6-6", "WEIGHT": "215",
+            "BIRTH_DATE": "1995-05-05T00:00:00", "AGE": 29.0, "EXP": "4",
+            "SCHOOL": "Test U", "PLAYER_ID": pid,
+        }
+        for pid, name, pos in players
+    ]
+    return pl.DataFrame(rows)
+
+
+def _patch_live_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    teams: list[tuple[int, str]],
+    roster_by_team: dict[int, pl.DataFrame],
+) -> None:
+    """Patch the live fetch seam to canned frames (no network)."""
+    from nba_sim.snapshot import rosters as rosters_mod
+
+    monkeypatch.setattr(
+        rosters_mod, "_get_team_list",
+        lambda: [{"id": tid, "abbreviation": abbr} for tid, abbr in teams],
+    )
+    monkeypatch.setattr(
+        rosters_mod, "fetch_roster",
+        lambda team_id, season, *, refresh=False: roster_by_team[team_id],
+    )
+
+
+def test_roster_bio_parsers() -> None:
+    """The Phase-8 bio parsers handle nba_api's quirky formats (§13.3)."""
+    from nba_sim.snapshot.rosters import (
+        parse_birth_date,
+        parse_experience,
+        parse_height_to_inches,
+        parse_weight,
+    )
+
+    assert parse_height_to_inches("6-9") == 81.0
+    assert parse_height_to_inches("") is None and parse_height_to_inches(None) is None
+    assert parse_weight("215") == 215.0 and parse_weight("") is None
+    assert parse_experience("R") == 0 and parse_experience("12") == 12
+    assert parse_experience("") is None and parse_experience(None) is None
+    assert parse_birth_date("1984-12-30T00:00:00") == _dt.date(1984, 12, 30)
+    assert parse_birth_date("DEC 30, 1984") == _dt.date(1984, 12, 30)
+    assert parse_birth_date("") is None and parse_birth_date("garbage") is None
+
+
+def test_live_rosters_route_malformed_to_qa(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A roster row that fails RawRosterEntry validation is routed to the QA
+    list (not raised) and the good rows survive — the v1 ETL's QA discipline
+    so one bad entry never poisons the refresh (§14.2)."""
+    good = _roster_df(_BOS, [(10, "Star A", "G"), (11, "Role B", "F")])
+    bad = pl.DataFrame([{  # PLAYER_ID null -> validation failure
+        "TeamID": _BOS, "SEASON": "2023", "LeagueID": "00", "PLAYER": "Broken",
+        "PLAYER_SLUG": "broken", "NUM": "", "POSITION": "", "HEIGHT": "6-1",
+        "WEIGHT": "180", "BIRTH_DATE": None, "AGE": None, "EXP": None,
+        "SCHOOL": None, "PLAYER_ID": None,
+    }])
+    roster = pl.concat([good, bad], how="vertical_relaxed")
+    _patch_live_fetch(monkeypatch, [(_BOS, "BOS")], {_BOS: roster})
+
+    df, malformed = build_rosters(
+        games=pl.DataFrame(), player_box=pl.DataFrame(),
+        as_of_date=_dt.date(2024, 3, 15), season=2023, offline=False,
+    )
+    assert df.columns == list(ROSTER_COLUMNS)
+    assert df.height == 2
+    assert sorted(df["player_id"].to_list()) == [10, 11]
+    assert len(malformed) == 1
+    assert malformed[0]["team_id"] == _BOS and malformed[0]["player_id"] is None
+    assert "validation" in malformed[0]["error"]
+
+
+def test_live_rosters_cache_hit_is_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """build_rosters(offline=False) goes through the real on-disk fetch cache:
+    a second build makes no new network call and returns byte-identical rosters
+    (§19 cache-discipline property). The network boundary (fetch._call_endpoint)
+    is mocked + counted; the cache dir is redirected to tmp_path."""
+    monkeypatch.setenv("NBA_SIM_CACHE_DIR", str(tmp_path / "cache"))
+    from nba_sim.data import fetch
+    from nba_sim.snapshot import rosters as rosters_mod
+
+    monkeypatch.setattr(
+        rosters_mod, "_get_team_list",
+        lambda: [{"id": _BOS, "abbreviation": "BOS"}, {"id": _LAL, "abbreviation": "LAL"}],
+    )
+    roster_for = {
+        _BOS: _roster_df(_BOS, [(10, "Star A", "G"), (11, "Role B", "F")]),
+        _LAL: _roster_df(_LAL, [(30, "Star D", "C")]),
+    }
+    calls = {"n": 0}
+
+    def _fake_endpoint(endpoint: str, params: dict[str, Any]) -> list[pl.DataFrame]:
+        calls["n"] += 1
+        tid = int(params["team_id"])
+        # CommonTeamRoster emits [roster, coaches]; fetch_roster reads dataset 0.
+        return [roster_for[tid], pl.DataFrame({"TEAM_ID": [tid]})]
+
+    monkeypatch.setattr(fetch, "_call_endpoint", _fake_endpoint)
+
+    empty = pl.DataFrame()
+    as_of = _dt.date(2024, 3, 15)
+    df1, qa1 = build_rosters(
+        games=empty, player_box=empty, as_of_date=as_of, season=2023, offline=False
+    )
+    n_cold = calls["n"]
+    assert n_cold == 2  # one network call per team (cold cache)
+    assert qa1 == []
+    assert df1.columns == list(ROSTER_COLUMNS)
+    assert df1.height == 3
+
+    df2, qa2 = build_rosters(
+        games=empty, player_box=empty, as_of_date=as_of, season=2023, offline=False
+    )
+    assert calls["n"] == n_cold  # cache hit: no new network calls
+    assert qa2 == []
+    assert df2.equals(df1)  # deterministic + identical
+
+
+def test_offline_live_feature_equivalence(
+    snapshot_env: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§19 ship gate: for the same as-of date the live refresh's feature outputs
+    match the offline-mode equivalent. The mocked live rosters reproduce the
+    offline membership + identity (names/positions, traded player 20 on both
+    teams) with non-null bio, so player_features / team_features / team_lastgame
+    (all interim-derived) are byte-identical; only the rosters' bio differs."""
+    as_of = (snapshot_env.dates[-1] + _dt.timedelta(days=1)).isoformat()
+
+    dest = refresh(offline=True, as_of=as_of)
+    off_players = pl.read_parquet(dest / PLAYER_FEATURES_FILENAME)
+    off_team = pl.read_parquet(dest / TEAM_FEATURES_FILENAME)
+    off_last = pl.read_parquet(dest / TEAM_LASTGAME_FILENAME)
+    off_rosters = pl.read_parquet(dest / ROSTERS_FILENAME)
+
+    _patch_live_fetch(
+        monkeypatch, [(_BOS, "BOS"), (_LAL, "LAL")],
+        {
+            _BOS: _roster_df(_BOS, [(10, "Star A", "G"), (11, "Role B", "F"),
+                                    (20, "Traded C", "F")]),
+            _LAL: _roster_df(_LAL, [(30, "Star D", "C"), (20, "Traded C", "F")]),
+        },
+    )
+    dest = refresh(offline=False, as_of=as_of)
+    live_players = pl.read_parquet(dest / PLAYER_FEATURES_FILENAME)
+    live_team = pl.read_parquet(dest / TEAM_FEATURES_FILENAME)
+    live_last = pl.read_parquet(dest / TEAM_LASTGAME_FILENAME)
+    live_rosters = pl.read_parquet(dest / ROSTERS_FILENAME)
+
+    # Feature tables are interim-derived -> identical regardless of roster source.
+    assert live_team.equals(off_team)
+    assert live_last.equals(off_last)
+    assert live_players.equals(off_players)
+
+    # Rosters share membership but differ in bio (the documented difference).
+    def _membership(df: pl.DataFrame) -> set[tuple[int, int]]:
+        return set(zip(df["team_id"].to_list(), df["player_id"].to_list(), strict=True))
+
+    assert _membership(live_rosters) == _membership(off_rosters)
+    assert off_rosters["height_in"].null_count() == off_rosters.height  # offline: null bio
+    assert live_rosters["height_in"].null_count() == 0  # live: CommonTeamRoster bio
 
 
 # ---------------------------------------------------------------------------

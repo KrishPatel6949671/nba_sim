@@ -33,9 +33,12 @@ as of the reference date.
 from __future__ import annotations
 
 import datetime as _dt
+from typing import Any
 
 import polars as pl
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from nba_sim.data.fetch import fetch_player_info, fetch_roster
 
 # Column order of rosters.parquet (§13.3, two_way dropped). Tests introspect
 # this so the schema can't silently drift.
@@ -141,6 +144,63 @@ def parse_height_to_inches(height: str | None) -> float | None:
     return float(feet * 12 + inches)
 
 
+def parse_weight(weight: str | None) -> float | None:
+    """Parse a ``WEIGHT`` string ("215") into pounds (215.0).
+
+    Returns ``None`` on empty / malformed input. Live (Phase 8) path only.
+    """
+    if not weight:
+        return None
+    try:
+        return float(str(weight).strip())
+    except ValueError:
+        return None
+
+
+def parse_experience(exp: str | None) -> int | None:
+    """Parse ``CommonTeamRoster.EXP`` into seasons of experience.
+
+    ``"R"`` (rookie) → 0; an integer-as-string ("12") → 12; empty / ``None``
+    / unparseable → ``None``. Live (Phase 8) path only.
+    """
+    if exp is None:
+        return None
+    s = str(exp).strip()
+    if not s:
+        return None
+    if s.upper() == "R":
+        return 0
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def parse_birth_date(value: str | None) -> _dt.date | None:
+    """Parse a roster ``BIRTH_DATE`` into a :class:`datetime.date`.
+
+    Handles nba_api's ISO timestamp form ("1984-12-30T00:00:00", also a bare
+    "1984-12-30") and the display form ("DEC 30, 1984"). Empty / ``None`` /
+    unparseable → ``None``. Live (Phase 8) path only.
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # ISO first — CommonTeamRoster usually returns "YYYY-MM-DDT00:00:00";
+    # datetime.fromisoformat also accepts a bare "YYYY-MM-DD" (py3.11+).
+    try:
+        return _dt.datetime.fromisoformat(s).date()
+    except ValueError:
+        pass
+    # Display form, e.g. "DEC 30, 1984".
+    try:
+        return _dt.datetime.strptime(s, "%b %d, %Y").date()
+    except ValueError:
+        return None
+
+
 def build_rosters(
     *,
     games: pl.DataFrame,
@@ -148,8 +208,9 @@ def build_rosters(
     as_of_date: _dt.date,
     season: int,
     offline: bool = True,
-) -> pl.DataFrame:
-    """Return the rosters frame (``ROSTER_COLUMNS`` schema) for the snapshot.
+    refresh: bool = False,
+) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
+    """Return ``(rosters, malformed)`` for the snapshot.
 
     Parameters
     ----------
@@ -165,19 +226,26 @@ def build_rosters(
         (:func:`nba_sim.snapshot.refresh.season_for_date`); restricts the
         roster to that season's appearances.
     offline
-        Phase 6: always ``True`` → derive from interim appearances. The
-        ``False`` (live ``CommonTeamRoster``) path is wired in Phase 8.
+        ``True`` → derive from interim appearances (no nba_api; ``games`` /
+        ``player_box`` are consumed). ``False`` → live ``CommonTeamRoster``
+        per team (:func:`_build_live_rosters`); ``games`` / ``player_box`` /
+        ``as_of_date`` are unused — only ``season`` selects the roster season.
+    refresh
+        Live path only: bypass the on-disk fetch cache for the roster /
+        player-info endpoints (forwarded to :func:`fetch_roster`).
 
     Returns
     -------
-    A frame with exactly ``ROSTER_COLUMNS``. Offline rows have null bio.
-    ``position`` is the most recent non-empty box-score position per
-    ``(team_id, player_id)`` on/before as_of, else "".
+    ``(rosters, malformed)`` where ``rosters`` is a frame with exactly
+    ``ROSTER_COLUMNS`` and ``malformed`` is the (possibly empty) list of
+    rejected live rows / failed team fetches for ``qa_report.json``. Offline
+    always returns ``malformed == []`` and null bio; live carries bio from
+    ``CommonTeamRoster`` (backfilled from ``CommonPlayerInfo`` only where
+    missing). ``position`` offline is the most recent non-empty box-score
+    position per ``(team_id, player_id)`` on/before as_of, else "".
     """
     if not offline:
-        raise NotImplementedError(
-            "live CommonTeamRoster fetch is Phase 8; pass offline=True"
-        )
+        return _build_live_rosters(season, refresh=refresh)
 
     # Box scores carry only game_id; pull date/season off the game header so we
     # can apply the leakage rule (date < as_of) and restrict to the as-of
@@ -189,7 +257,7 @@ def build_rosters(
     ).filter((pl.col("date") < as_of_date) & (pl.col("season") == season))
 
     if appearances.is_empty():
-        return pl.DataFrame(schema=_ROSTER_SCHEMA)
+        return pl.DataFrame(schema=_ROSTER_SCHEMA), []
 
     # Most-recent value wins for trade / name-change churn: sort ascending so
     # `.last()` within each (team, player) group is the latest appearance.
@@ -227,4 +295,138 @@ def build_rosters(
         .select([pl.col(c).cast(dt) for c, dt in _ROSTER_SCHEMA.items()])
         .sort(["team_id", "player_id"])
     )
-    return out
+    return out, []
+
+
+# ---------------------------------------------------------------------------
+# Live (Phase 8) — CommonTeamRoster per team, validated + bio-backfilled.
+# ---------------------------------------------------------------------------
+
+
+def _get_team_list() -> list[dict[str, Any]]:
+    """Canonical ``{id, abbreviation, ...}`` for the 30 NBA teams.
+
+    Lazy import keeps ``import nba_sim.snapshot.rosters`` free of nba_api (the
+    offline path never needs it). Tests monkeypatch this to inject a fake team
+    list, so the live builder is exercisable without the static dataset.
+    """
+    from nba_api.stats.static import teams
+
+    return list(teams.get_teams())
+
+
+def _player_info_bio(player_id: int, *, refresh: bool = False) -> dict[str, Any] | None:
+    """Pull ``(height_in, weight_lbs, experience_years)`` from
+    ``CommonPlayerInfo`` to backfill bio the roster row left empty.
+
+    Best-effort: returns ``None`` on any fetch / empty-frame failure (bio is
+    nullable, §13.3). Only invoked for the rare player whose ``CommonTeamRoster``
+    row is missing a bio field, so the refresh stays roster-bound (§14.2).
+    """
+    try:
+        df = fetch_player_info(player_id, refresh=refresh)
+    except Exception:  # network/HTTP after tenacity retries — bio is optional
+        return None
+    if df.is_empty():
+        return None
+    rec = df.row(0, named=True)
+    exp_raw = rec.get("SEASON_EXP")
+    experience_years = (
+        int(exp_raw)
+        if isinstance(exp_raw, int | float)
+        else parse_experience(None if exp_raw is None else str(exp_raw))
+    )
+    height = rec.get("HEIGHT")
+    weight = rec.get("WEIGHT")
+    return {
+        "height_in": parse_height_to_inches(None if height is None else str(height)),
+        "weight_lbs": parse_weight(None if weight is None else str(weight)),
+        "experience_years": experience_years,
+    }
+
+
+def _roster_row_from_entry(
+    entry: RawRosterEntry, team_id: int, team_abbr: str, *, refresh: bool = False
+) -> dict[str, Any]:
+    """Map a validated ``RawRosterEntry`` onto one ``ROSTER_COLUMNS`` dict.
+
+    ``team_id`` / ``team_abbr`` come from the canonical team list (authoritative;
+    ``CommonTeamRoster.TeamID`` is unreliable). Bio is parsed from the roster
+    row and, only where a field is missing, backfilled from ``CommonPlayerInfo``.
+    """
+    height_in = parse_height_to_inches(entry.HEIGHT)
+    weight_lbs = parse_weight(entry.WEIGHT)
+    experience_years = parse_experience(entry.EXP)
+    birth_date = parse_birth_date(entry.BIRTH_DATE)
+
+    if height_in is None or weight_lbs is None or experience_years is None:
+        info = _player_info_bio(entry.PLAYER_ID, refresh=refresh)
+        if info is not None:
+            if height_in is None:
+                height_in = info["height_in"]
+            if weight_lbs is None:
+                weight_lbs = info["weight_lbs"]
+            if experience_years is None:
+                experience_years = info["experience_years"]
+
+    return {
+        "team_id": team_id,
+        "team_abbr": team_abbr,
+        "player_id": int(entry.PLAYER_ID),
+        "player_name": entry.PLAYER,
+        "position": normalize_position(entry.POSITION),
+        "height_in": height_in,
+        "weight_lbs": weight_lbs,
+        "jersey": entry.NUM if entry.NUM else None,
+        "experience_years": experience_years,
+        "birth_date": birth_date,
+    }
+
+
+def _build_live_rosters(
+    season: int, *, refresh: bool = False
+) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
+    """Fetch + validate live ``CommonTeamRoster`` for all 30 teams (§14.2).
+
+    For each canonical team, fetch the roster (rate-limited + cached via
+    :func:`fetch_roster`), validate each row through :class:`RawRosterEntry`,
+    and assemble a ``ROSTER_COLUMNS`` row (bio from the roster, backfilled from
+    ``CommonPlayerInfo`` only where missing). A failed team fetch or a row that
+    fails validation is appended to ``malformed`` (→ ``qa_report.json``) so one
+    bad entry never poisons the whole refresh, mirroring the v1 ETL's QA
+    discipline.
+    """
+    rows: list[dict[str, Any]] = []
+    malformed: list[dict[str, Any]] = []
+
+    for team in _get_team_list():
+        team_id = int(team["id"])
+        team_abbr = str(team["abbreviation"])
+        try:
+            raw = fetch_roster(team_id, season, refresh=refresh)
+        except Exception as e:  # network/HTTP after tenacity retries
+            malformed.append({"team_id": team_id, "error": f"fetch_failed: {e}"})
+            continue
+
+        for rec in raw.iter_rows(named=True):
+            try:
+                entry = RawRosterEntry.model_validate(rec)
+            except ValidationError as e:
+                malformed.append({
+                    "team_id": team_id,
+                    "player_id": rec.get("PLAYER_ID"),
+                    "error": f"validation: {e.errors(include_url=False)}",
+                })
+                continue
+            rows.append(_roster_row_from_entry(entry, team_id, team_abbr, refresh=refresh))
+
+    if not rows:
+        return pl.DataFrame(schema=_ROSTER_SCHEMA), malformed
+
+    frame = (
+        pl.DataFrame(rows)
+        .select([pl.col(c).cast(dt) for c, dt in _ROSTER_SCHEMA.items()])
+        .unique(subset=["team_id", "player_id"], keep="first")
+        .sort(["team_id", "player_id"])
+    )
+    return frame, malformed
