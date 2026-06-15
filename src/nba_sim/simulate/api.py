@@ -29,6 +29,7 @@ determinism across CUDA driver / cuDNN versions matters.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 from pathlib import Path
 
 import polars as pl
@@ -37,13 +38,17 @@ import torch
 from nba_sim.data.schema import BoxScore, BoxScoreEnsemble
 from nba_sim.models.hierarchical import HierarchicalBoxScoreModel
 from nba_sim.simulate.sampler import sample_box_score, sample_ensemble
+from nba_sim.snapshot.build import build_synthetic_game_batch
+from nba_sim.snapshot.status import STALE_AFTER_DAYS, read_provenance
 from nba_sim.training.dataset import BoxScoreDataset, collate_games
+
+logger = logging.getLogger(__name__)
 
 
 def simulate_game(
     home_team: str,
     away_team: str,
-    date: str | _dt.date,
+    date: str | _dt.date | None = None,
     *,
     home_roster: list[str] | None = None,
     away_roster: list[str] | None = None,
@@ -54,16 +59,31 @@ def simulate_game(
     train_parquet: str | Path = "data/processed/train.parquet",
     val_parquet: str | Path = "data/processed/val.parquet",
     test_parquet: str | Path | None = "data/processed/test.parquet",
+    snapshot_dir: str | Path = "data/snapshot",
+    interim_dir: str | Path = "data/interim",
+    force_snapshot: bool = False,
+    stale_ok: bool = False,
     return_distributions: bool = False,
 ) -> BoxScore | BoxScoreEnsemble:
     """Simulate one game (or an ensemble) between ``home_team`` and ``away_team``.
 
+    Two paths (v2PLAN.md §16.2):
+
+    - ``date is None`` (the default) — the **snapshot path**: assemble the
+      game from the local ``data/snapshot/`` written by ``nba-sim refresh`` and
+      predict a game that hasn't happened yet. The output ``BoxScore.date`` is
+      the snapshot's ``as_of_date``.
+    - ``date`` given — the **v1 path**: the ``(home, away, date)`` game must
+      exist in the val/test parquets. ``force_snapshot=True`` ignores this
+      lookup and uses the snapshot path even when a date is supplied (useful
+      for checking snapshot quality on a known date).
+
     Args:
         home_team: 3-letter NBA team abbreviation (e.g. ``"BOS"``).
         away_team: same.
-        date: ISO ``"YYYY-MM-DD"`` string or :class:`datetime.date`.
-        home_roster, away_roster: **v2** — not yet supported. Pass
-            ``None`` to use the rosters in the processed data.
+        date: ISO ``"YYYY-MM-DD"`` / :class:`datetime.date` / ``None``.
+        home_roster, away_roster: **v2.1** — not yet supported. Pass
+            ``None`` to use the rosters from the data.
         n_samples: ``1`` returns a :class:`BoxScore`; >1 returns a
             :class:`BoxScoreEnsemble` with mean / 80% PI / all samples.
         seed: RNG seed for determinism. When None, sampling is
@@ -72,21 +92,27 @@ def simulate_game(
         checkpoint: path to a trained model checkpoint
             (``models/best.pt`` is the default produced by training).
         train_parquet: train split — required to pin the player_id_map
-            and z-score statistics so val/test rows are featurized
-            identically to how the model saw training data.
+            and z-score statistics (both paths).
         val_parquet, test_parquet: searched in order for the
-            ``(home_team, away_team, date)`` row.
-        return_distributions: **v2** — not yet supported.
+            ``(home_team, away_team, date)`` row (v1 path only).
+        snapshot_dir: ``data/snapshot/`` directory (snapshot path).
+        interim_dir: interim root, read only for ``h2h_last_meeting_margin``
+            (snapshot path).
+        force_snapshot: use the snapshot path even when ``date`` is given.
+        stale_ok: silence the "snapshot is N days stale" warning.
+        return_distributions: **v2.1** — not yet supported.
 
     Returns:
         :class:`BoxScore` when ``n_samples == 1``, otherwise
         :class:`BoxScoreEnsemble`.
 
     Raises:
-        NotImplementedError: when v2-only kwargs are set
+        NotImplementedError: when v2.1-only kwargs are set
             (``home_roster``, ``away_roster``, ``return_distributions``).
-        LookupError: when the requested game isn't in any of the
-            provided parquets.
+        FileNotFoundError: snapshot path, when ``snapshot_dir`` is missing
+            files — run ``nba-sim refresh`` first.
+        LookupError: v1 path, when the game isn't in the parquets; snapshot
+            path, when a team isn't in the roster snapshot.
         ValueError: on bad ``n_samples``.
     """
     if home_roster is not None or away_roster is not None:
@@ -99,11 +125,18 @@ def simulate_game(
     if n_samples < 1:
         raise ValueError(f"n_samples must be >= 1, got {n_samples}")
 
-    date_obj = (
-        _dt.date.fromisoformat(date) if isinstance(date, str) else date
-    )
     device_obj = _resolve_device(device)
 
+    if date is None or force_snapshot:
+        return _simulate_from_snapshot(
+            home_team, away_team,
+            n_samples=n_samples, seed=seed, device_obj=device_obj,
+            checkpoint=checkpoint, train_parquet=train_parquet,
+            snapshot_dir=snapshot_dir, interim_dir=interim_dir, stale_ok=stale_ok,
+        )
+
+    # v1 path: the (home, away, date) game must already exist in val/test.
+    date_obj = _dt.date.fromisoformat(date) if isinstance(date, str) else date
     train_ds = BoxScoreDataset(train_parquet)
     eval_ds, idx = _locate_game(
         home_team, away_team, date_obj,
@@ -159,6 +192,78 @@ def _resolve_device(spec: str) -> torch.device:
     if spec == "cuda" and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(spec)
+
+
+def _simulate_from_snapshot(
+    home_team: str,
+    away_team: str,
+    *,
+    n_samples: int,
+    seed: int | None,
+    device_obj: torch.device,
+    checkpoint: str | Path,
+    train_parquet: str | Path,
+    snapshot_dir: str | Path,
+    interim_dir: str | Path,
+    stale_ok: bool,
+) -> BoxScore | BoxScoreEnsemble:
+    """Snapshot path (``date is None`` / ``force_snapshot``): assemble the game
+    from ``data/snapshot/``, run one forward pass, and sample.
+
+    The synthetic batch carries no teacher-forcing keys, so the player head
+    conditions on the team head's predicted pace / off_rtg — exactly what
+    inference requires for an unplayed game. ``BoxScore.date`` becomes the
+    snapshot's ``as_of_date``.
+    """
+    snap_dir = Path(snapshot_dir)
+    _warn_if_stale(snap_dir, stale_ok=stale_ok)
+    batch, home_players, away_players, as_of_iso = build_synthetic_game_batch(
+        home_team=home_team,
+        away_team=away_team,
+        snapshot_dir=snap_dir,
+        train_parquet=Path(train_parquet),
+        interim_dir=Path(interim_dir),
+    )
+    batch = {k: v.to(device_obj) for k, v in batch.items()}
+    model = HierarchicalBoxScoreModel.from_checkpoint(checkpoint).to(device_obj).eval()
+    with torch.no_grad():
+        dist = model(batch)
+
+    if n_samples == 1:
+        return sample_box_score(
+            dist,
+            home_players=home_players, away_players=away_players,
+            home_team=home_team, away_team=away_team,
+            date_iso=as_of_iso, seed=seed,
+        )
+    return sample_ensemble(
+        dist, n_samples,
+        home_players=home_players, away_players=away_players,
+        home_team=home_team, away_team=away_team,
+        date_iso=as_of_iso, seed=seed,
+    )
+
+
+def _warn_if_stale(snapshot_dir: Path, *, stale_ok: bool) -> None:
+    """Log a warning when the snapshot's interim data is more than
+    ``STALE_AFTER_DAYS`` old (§16.4) — a warning, never a failure. ``stale_ok``
+    silences it; a missing snapshot is left for
+    :func:`build_synthetic_game_batch` to report with the refresh hint.
+    """
+    if stale_ok:
+        return
+    try:
+        provenance = read_provenance(snapshot_dir)
+    except FileNotFoundError:
+        return
+    interim_latest = _dt.date.fromisoformat(provenance["interim_latest_game_date"])
+    age = (_dt.datetime.now(_dt.UTC).date() - interim_latest).days
+    if age > STALE_AFTER_DAYS:
+        logger.warning(
+            "snapshot is %d days stale (interim latest %s) — run 'nba-sim "
+            "refresh', or pass stale_ok=True to silence",
+            age, interim_latest,
+        )
 
 
 def _locate_game(

@@ -25,12 +25,16 @@ from typing import Any
 
 import polars as pl
 import pytest
+import torch
 
 from nba_sim.data.etl import (
     GAMES_FILENAME,
     PLAYER_BOX_FILENAME,
     TEAM_BOX_FILENAME,
+    SplitSpec,
     _models_to_df,
+    build_feature_tables,
+    interim_to_processed,
 )
 from nba_sim.data.schema import Game, PlayerBoxLine, TeamBoxLine
 from nba_sim.features.rolling import player_rolling, season_to_date
@@ -42,6 +46,7 @@ from nba_sim.snapshot import (
     TEAM_FEATURES_FILENAME,
     TEAM_LASTGAME_FILENAME,
 )
+from nba_sim.snapshot.build import build_synthetic_game_batch
 from nba_sim.snapshot.refresh import (
     NULL_AT_REFRESH_NUMERIC,
     SNAPSHOT_GAME_PREFIX,
@@ -54,7 +59,23 @@ from nba_sim.snapshot.refresh import (
 )
 from nba_sim.snapshot.rosters import NULLABLE_BIO_COLUMNS, ROSTER_COLUMNS, build_rosters
 from nba_sim.snapshot.status import format_status, read_provenance
-from nba_sim.training.dataset import _MATCHUP_TEAM_DIFF_BASES, _PLAYER_NUMERIC_COLS
+from nba_sim.training.dataset import (
+    _MATCHUP_TEAM_DIFF_BASES,
+    _PLAYER_NUMERIC_COLS,
+    BoxScoreDataset,
+)
+
+# Model-input batch keys build_synthetic_game_batch must emit (B==1).
+_MODEL_INPUT_KEYS = {
+    "home_player_feats", "away_player_feats",
+    "home_player_ids", "away_player_ids",
+    "home_role_ids", "away_role_ids",
+    "home_mask", "away_mask",
+    "context", "matchup",
+}
+# Indices in the 47-dim player numeric block that build.py cold-starts to the
+# league mean (opponent-vs-position), so they won't match v1 exactly.
+_OPP_COLS = ("opp_def_rtg_vs_pos", "opp_blk_allowed_vs_pos")
 
 # Season used by the fixture interim builder (start-year).
 _FIXTURE_SEASON = 2023
@@ -425,6 +446,105 @@ def test_snapshot_status_block_format() -> None:
 
     stale = format_status(provenance, now=_dt.datetime(2024, 4, 1, tzinfo=_dt.UTC))
     assert "STALE" in stale and "run 'nba-sim refresh'" in stale
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — build_synthetic_game_batch (§15.5)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def processed_env(
+    snapshot_env: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> tuple[_Fixture, Path, Path]:
+    """Extend ``snapshot_env`` with the v1 processed parquets (train + val both
+    built from the fixture season) so ``build.py`` can adopt train's
+    feature_stats / id_map and the equivalence test can read v1's per-game
+    vectors."""
+    processed_root = snapshot_env.interim_root.parent / "processed"
+    monkeypatch.setenv("NBA_SIM_PROCESSED_DIR", str(processed_root))
+    build_feature_tables(snapshot_env.season)
+    interim_to_processed(
+        SplitSpec(train=[snapshot_env.season], val=[snapshot_env.season], test=[])
+    )
+    return snapshot_env, processed_root / "train.parquet", processed_root / "val.parquet"
+
+
+def test_build_synthetic_game_batch_shapes(
+    processed_env: tuple[_Fixture, Path, Path],
+) -> None:
+    """The batch carries exactly the model-input keys with B==1 and the
+    documented tensor shapes/dtypes; the player lists match the active masks."""
+    fix, train_pq, _ = processed_env
+    dest = refresh(offline=True)
+    batch, home_players, away_players, as_of_iso = build_synthetic_game_batch(
+        home_team="BOS", away_team="LAL",
+        snapshot_dir=dest, train_parquet=train_pq, interim_dir=fix.interim_root,
+    )
+    p = 15
+    assert set(batch) == _MODEL_INPUT_KEYS
+    assert batch["home_player_feats"].shape == (1, p, 55)
+    assert batch["away_player_feats"].shape == (1, p, 55)
+    assert batch["home_player_ids"].shape == (1, p)
+    assert batch["home_player_ids"].dtype == torch.int64
+    assert batch["home_mask"].shape == (1, p)
+    assert batch["home_mask"].dtype == torch.bool
+    assert batch["context"].shape == (1, 24)
+    assert batch["matchup"].shape == (1, 16)
+    assert as_of_iso == (fix.dates[-1] + _dt.timedelta(days=1)).isoformat()
+    assert int(batch["home_mask"].sum()) == len(home_players)
+    assert int(batch["away_mask"].sum()) == len(away_players)
+
+
+def test_build_synthetic_game_batch_no_nans(
+    processed_env: tuple[_Fixture, Path, Path],
+) -> None:
+    """No non-finite values reach the model: the null opp-vs-position numerics
+    standardize to the league mean (cold-start, §15.4)."""
+    fix, train_pq, _ = processed_env
+    dest = refresh(offline=True)
+    batch, *_ = build_synthetic_game_batch(
+        home_team="BOS", away_team="LAL",
+        snapshot_dir=dest, train_parquet=train_pq, interim_dir=fix.interim_root,
+    )
+    for key in ("home_player_feats", "away_player_feats", "context", "matchup"):
+        assert torch.isfinite(batch[key]).all(), key
+
+
+def test_context_vector_matches_v1_at_known_date(
+    processed_env: tuple[_Fixture, Path, Path],
+) -> None:
+    """At a real game date the snapshot-built context + matchup vectors match
+    v1's vectors for that game within float noise (§15.5). The fixture's 2-day
+    spacing keeps is_3in4 / is_4in6 False in v1 too, so the full 24- and 16-dim
+    vectors align. p10's player feats match v1 except the two cold-started
+    opp-vs-position numerics."""
+    fix, train_pq, val_pq = processed_env
+    known = fix.dates[-1]
+    last_gid = fix.gids[-1]
+
+    train_ds = BoxScoreDataset(train_pq)
+    val_ds = BoxScoreDataset(
+        val_pq, player_id_map=train_ds.player_id_map, feature_stats=train_ds.feature_stats
+    )
+    matches = [i for i, g in enumerate(val_ds._games) if g["game_id"][0] == last_gid]
+    assert matches, f"game {last_gid} not in val parquet"
+    v1 = val_ds[matches[0]]
+
+    dest = refresh(offline=True, as_of=known.isoformat())
+    batch, _hp, _ap, _iso = build_synthetic_game_batch(
+        home_team="BOS", away_team="LAL",
+        snapshot_dir=dest, train_parquet=train_pq, interim_dir=fix.interim_root,
+    )
+
+    assert torch.allclose(batch["context"][0], v1["context"], atol=1e-4)
+    assert torch.allclose(batch["matchup"][0], v1["matchup"], atol=1e-4)
+
+    # p10 has the top minutes under both orderings -> home slot 0 on each side.
+    opp_idx = {_PLAYER_NUMERIC_COLS.index(c) for c in _OPP_COLS}
+    keep = [i for i in range(55) if i not in opp_idx]
+    snap_p10 = batch["home_player_feats"][0, 0, keep]
+    v1_p10 = v1["home_player_feats"][0, keep]
+    assert torch.allclose(snap_p10, v1_p10, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------

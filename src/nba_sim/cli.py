@@ -270,47 +270,67 @@ def evaluate(
 def simulate(
     home: str = typer.Option(..., help="3-letter home team abbr"),
     away: str = typer.Option(..., help="3-letter away team abbr"),
-    date: str = typer.Option(..., help="ISO YYYY-MM-DD"),
+    date: str | None = typer.Option(
+        None, help="ISO YYYY-MM-DD. Omit to simulate from the snapshot (a game that hasn't happened)."
+    ),
     n_samples: int = typer.Option(1, help="1=single sample; >1=ensemble"),
     seed: int | None = typer.Option(None, help="RNG seed for determinism"),
     checkpoint: Path = typer.Option(Path("models/best.pt")),
     train_parquet: Path = typer.Option(Path("data/processed/train.parquet")),
     val_parquet: Path = typer.Option(Path("data/processed/val.parquet")),
     test_parquet: Path = typer.Option(Path("data/processed/test.parquet")),
+    snapshot_dir: Path = typer.Option(Path("data/snapshot"), help="Snapshot dir (no-date path)."),
+    interim_dir: Path = typer.Option(Path("data/interim"), help="Interim root (for h2h)."),
+    force_snapshot: bool = typer.Option(
+        False, "--force-snapshot", help="Use the snapshot path even when --date is given."
+    ),
+    stale_ok: bool = typer.Option(
+        False, "--stale-ok", help="Silence the stale-snapshot warning."
+    ),
     device: str = typer.Option("auto", help="{auto|cpu|cuda}"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Simulate a single game (or an ensemble). Prints box score to stdout.
 
-    The (home, away, date) tuple must currently correspond to a game
-    present in the val or test split. Custom rosters / arbitrary dates
-    are a v2 feature (see simulate/api.py docstring).
+    With ``--date`` the (home, away, date) game must exist in the val/test
+    split (v1 path). Without ``--date`` the game is built from the local
+    snapshot (``nba-sim refresh`` first) — a game that hasn't happened yet.
+    ``--force-snapshot`` uses the snapshot path even when a date is given.
     """
     _setup_logging(verbose)
     from nba_sim.simulate.api import simulate_game
 
-    for label, p in (
-        ("checkpoint", checkpoint),
-        ("train", train_parquet),
-        ("val", val_parquet),
-    ):
+    use_snapshot = date is None or force_snapshot
+    required = [("checkpoint", checkpoint), ("train", train_parquet)]
+    if not use_snapshot:
+        # The v1 path looks the game up in the val parquet.
+        required.append(("val", val_parquet))
+    for label, p in required:
         if not p.exists():
             raise typer.BadParameter(f"{label} not found: {p}")
 
     test_arg = test_parquet if test_parquet.exists() else None
 
-    result = simulate_game(
-        home_team=home,
-        away_team=away,
-        date=date,
-        n_samples=n_samples,
-        seed=seed,
-        device=device,
-        checkpoint=checkpoint,
-        train_parquet=train_parquet,
-        val_parquet=val_parquet,
-        test_parquet=test_arg,
-    )
+    try:
+        result = simulate_game(
+            home_team=home,
+            away_team=away,
+            date=date,
+            n_samples=n_samples,
+            seed=seed,
+            device=device,
+            checkpoint=checkpoint,
+            train_parquet=train_parquet,
+            val_parquet=val_parquet,
+            test_parquet=test_arg,
+            snapshot_dir=snapshot_dir,
+            interim_dir=interim_dir,
+            force_snapshot=force_snapshot,
+            stale_ok=stale_ok,
+        )
+    except (FileNotFoundError, LookupError) as e:
+        # No snapshot / team or game not found — surface cleanly, not a traceback.
+        raise typer.BadParameter(str(e)) from e
 
     if n_samples == 1:
         _print_box_score(result)
