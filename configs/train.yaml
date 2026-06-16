@@ -72,7 +72,7 @@ loss_weights:
   # dominating the per-stat NLLs. First attempt at λ=0.1 with MSE broke
   # the FGA/FGM heads (per-stat MAE doubled); 0.01 with Huber is the
   # corrected starting point. 0 = inert.
-  coupling: 0.01
+  coupling: 0.03
 
 tracking:
   # Default 'none' (stdout-only). Set to 'wandb' AFTER `wandb login` has

@@ -67,6 +67,22 @@ from nba_sim.training.dataset import (
 # A projected lineup names its top-5-by-recent-minutes as starters; everyone
 # else is bench. The model only ever saw is_starter as a 0/1 flag.
 _N_STARTERS = 5
+# Projected rotation. A roster player is marked active (``dnp = False``) only if
+# they are among the top ``_ROTATION_SIZE`` by recent minutes AND clear the
+# minutes floor (projected starters are always active). The team-point total in
+# the sampler is a *sum* of per-player count heads, which fire for every active
+# slot — so feeding the whole 15-man roster as ``dnp = False`` overshoots the
+# total by ~30-45 pts. The model trained on ~10.6 active players/side, so we cap
+# at the typical rotation. ``p_min_avg_10`` is per-appearance minutes (it does
+# not encode play frequency), so a rank cap — not a minutes threshold alone — is
+# what bounds the count. The floor (P(play|p_min_avg_10) crosses ~0.5 near 2-4
+# min) lets genuinely shallow rotations fall below the cap. (v2PLAN §15.4 / §20:
+# no injury feed, so the rotation is *projected* from recent minutes; the
+# residual player-sum-vs-team-head gap is the model's own, present on real
+# games too — closing it fully needs the team-head allocation, a training-time
+# change.)
+_ROTATION_SIZE = 10
+_ROTATION_MIN_AVG_MINUTES = 5.0
 # rest_days is clipped to 0..5 nights (v1 context.py convention).
 _REST_DAYS_MAX = 5
 
@@ -226,18 +242,30 @@ def _build_side_frame(
     truncation). Overwrites the two schedule-derived null numerics
     (``rest_days`` / ``travel_miles_prev``) with the computed values, leaving
     the two opp-vs-position numerics null (→ standardized mean). Adds the four
-    bool flags (``is_starter`` = top-5 by minutes, ``dnp`` = False, ``is_home``,
-    ``b2b``) and the dummy ``minutes`` + count-stat columns ``_build_side``
+    bool flags and the dummy ``minutes`` + count-stat columns ``_build_side``
     reads but the simulator discards.
+
+    ``dnp`` is **projected from recent minutes**, not hardcoded ``False``: a
+    player is active only if a projected starter (top-5) or among the top
+    ``_ROTATION_SIZE`` by recent minutes while clearing
+    ``_ROTATION_MIN_AVG_MINUTES`` (null → bench). This caps the active set near
+    the ~10.6-players/side the model trained on; feeding the whole 15-man
+    roster as ``dnp = False`` is what made the summed team points overshoot
+    (the count heads fire for every "active" slot). ``is_starter`` = top-5 by
+    recent minutes.
     """
     side = (
         player_features.filter(pl.col("team_id") == team_id)
         .sort("p_min_avg_10", descending=True, nulls_last=True)
         .head(max_players)
     )
+    rank = pl.int_range(0, pl.len())
+    is_starter = rank < _N_STARTERS
+    in_rotation = (rank < _ROTATION_SIZE) & (pl.col("p_min_avg_10") >= _ROTATION_MIN_AVG_MINUTES)
+    active = (is_starter | in_rotation).fill_null(False)
     return side.with_columns(
-        (pl.int_range(0, pl.len()) < _N_STARTERS).alias("is_starter"),
-        pl.lit(False).alias("dnp"),
+        is_starter.alias("is_starter"),
+        (~active).alias("dnp"),
         pl.lit(is_home).alias("is_home"),
         pl.lit(b2b).alias("b2b"),
         pl.lit(rest_days, dtype=pl.Float64).alias("rest_days"),

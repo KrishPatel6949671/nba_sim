@@ -547,6 +547,31 @@ def test_context_vector_matches_v1_at_known_date(
     assert torch.allclose(snap_p10, v1_p10, atol=1e-4)
 
 
+def test_snapshot_projects_a_capped_rotation() -> None:
+    """``build._build_side_frame`` projects a ~10-man rotation: it caps the
+    active (``dnp == False``) set at ``_ROTATION_SIZE`` and benches the deep
+    tail, instead of marking the whole 15-man roster active. Feeding every
+    roster spot as ``dnp == False`` is what made the per-player count heads
+    (summed into team points) overshoot the team total."""
+    from nba_sim.snapshot.build import _N_STARTERS, _ROTATION_SIZE, _build_side_frame
+
+    # 14 players, strictly descending recent minutes incl. a sub-floor tail.
+    mins = [34.0, 31.0, 28.0, 26.0, 22.0, 18.0, 15.0, 12.0, 9.0, 7.0, 4.0, 2.0, 1.0, 0.0]
+    pf = pl.DataFrame({
+        "team_id": [99] * len(mins),
+        "player_id": list(range(len(mins))),
+        "p_min_avg_10": mins,
+    })
+    side = _build_side_frame(
+        pf, team_id=99, is_home=True, rest_days=1.0, b2b=False, travel=0.0, max_players=15,
+    )
+    n_active = int((~side["dnp"]).sum())
+    assert n_active == _ROTATION_SIZE  # capped at the rotation size, not 14
+    assert int(side["is_starter"].sum()) == _N_STARTERS
+    assert side["dnp"][:_N_STARTERS].to_list() == [False] * _N_STARTERS  # starters active
+    assert side["dnp"][-1] and side["dnp"][-2]  # deep-bench tail benched
+
+
 # ---------------------------------------------------------------------------
 # Phase 8 — live roster resolution (non-network: fetch layer is mocked)
 # ---------------------------------------------------------------------------
