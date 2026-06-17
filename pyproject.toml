@@ -45,6 +45,9 @@ dependencies = [
     "python-dotenv==1.0.1",
     # CLI
     "typer==0.15.1",
+    # typer 0.15.1 calls click's Parameter.make_metavar() without `ctx`,
+    # which click >=8.2 made required -> --help crashes. Pin click below 8.2.
+    "click==8.1.8",
     "rich==13.9.4",
     # Experiment tracking
     "wandb==0.19.1",
